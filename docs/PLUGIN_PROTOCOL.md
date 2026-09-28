@@ -61,3 +61,9 @@ Agent 插件不包含可执行代码：
 IM 插件使用 `kind: "im"`，增加 `entrypoints`，例如 `{"darwin-arm64":"bin/connector"}`，以及 `permissions` 列表。平台键为 darwin/windows/linux 与 amd64/arm64 的组合。所有可执行文件在 files 中校验。更新以相同 ID 导入新版本插件包；官方 CLI 通过插件中心单独更新。
 
 第三方 IM 插件自行实现初始化协议，不依赖系统 CLI。插件启停与账号同步状态独立；停用后需在账号设置中恢复同步。
+
+## 诊断事件
+
+`diagnostic` 通知携带 `operation`、`detail`，可附 `conversationId`、`exitCode`。主应用再次脱敏后在 SQLite 的 diagnostics bucket 保存最近 200 条，GUI 底部“CLI 诊断记录”可查看和复制。适配器收集订阅退出前的 stderr 尾部，明确退订/关闭不报告意外退出。`sync.gap` 中 `disconnected: true` 表示订阅进程已退出，需要独立退避重连；普通解析缺口只补拉，不重建仍在运行的订阅。
+
+平台明确拒绝保密群消息时返回 `confidential_group`，主应用持久保存该会话的停拉策略，不再自动或手动拉取历史/增量，也不再建立订阅。首次发现依赖平台错误，未获得群保密属性前无法提前判断。

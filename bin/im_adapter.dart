@@ -7,6 +7,8 @@ import 'package:path/path.dart' as p;
 import '../lib/src/core/models.dart';
 // ignore: avoid_relative_lib_imports
 import '../lib/src/core/normalize.dart';
+// ignore: avoid_relative_lib_imports
+import '../lib/src/core/diagnostics.dart';
 
 void emit(Json j) => stdout.writeln(jsonEncode({'jsonrpc': '2.0', ...j}));
 
@@ -17,6 +19,7 @@ class Adapter {
   final streams = <String, Process>{};
   final capabilities = <String, dynamic>{};
   bool initialized = false;
+  final _groupProfileRetry = <String, DateTime>{};
   Map<String, String> get environment => {
     for (final key in [
       'PATH',
@@ -58,6 +61,23 @@ class Adapter {
     if (user && platform == 'feishu') ...['--as', 'user'],
     if (json) ...['--format', 'json'],
   ];
+  void diagnostic(
+    String operation,
+    String message, {
+    int? exitCode,
+    String conversationId = '',
+  }) {
+    emit({
+      'method': 'diagnostic',
+      'params': {
+        'operation': operation,
+        'detail': diagnosticText(message),
+        'exitCode': ?exitCode,
+        'conversationId': conversationId,
+      },
+    });
+  }
+
   Future<dynamic> run(
     Object id,
     List<String> args, {
@@ -111,8 +131,10 @@ class Adapter {
         .forEach((s) => capture(s, errors));
     if (input != null) process.stdin.write(input);
     await process.stdin.close();
+    int? exitCode;
     try {
       final code = await process.exitCode.timeout(timeout);
+      exitCode = code;
       await out;
       await err;
       if (code != 0) {
@@ -122,7 +144,8 @@ class Adapter {
         try {
           final j = object(jsonDecode(errors.toString()));
           final e = object(j['error']);
-          message = '${e['message'] ?? j['message'] ?? message}';
+          message =
+              '${e['message'] ?? j['message'] ?? j['errorMsg'] ?? message}';
           kind = '${e['type'] ?? kind}';
           retryAfter = int.tryParse(
             '${e['retry_after'] ?? e['retryAfter'] ?? j['retry_after']}',
@@ -143,7 +166,22 @@ class Adapter {
       }
     } on TimeoutException {
       process.kill();
+      diagnostic(
+        args.take(2).join(' '),
+        'CLI 超时\n${errors.toString()}',
+        exitCode: exitCode,
+      );
       throw const AppFailure('timeout', 'CLI 超时；写入结果未知');
+    } catch (e) {
+      diagnostic(
+        args.take(2).join(' '),
+        '$e\n${errors.toString()}',
+        exitCode: exitCode,
+      );
+      if (confidentialFailure('$e') || confidentialFailure(errors.toString())) {
+        throw const AppFailure('confidential_group', '该群为保密群，无法获取消息记录');
+      }
+      rethrow;
     } finally {
       processes.remove(id);
     }
@@ -664,7 +702,11 @@ class Adapter {
         final profiles = <String, Json>{};
         if (platform == 'dingtalk' &&
             conversation['kind'] == 'group' &&
-            openIds.isNotEmpty) {
+            openIds.isNotEmpty &&
+            !(_groupProfileRetry['${conversation['id']}']?.isAfter(
+                  DateTime.now(),
+                ) ??
+                false)) {
           try {
             final value = await run(
               id,
@@ -697,6 +739,9 @@ class Adapter {
               }
             }
           } on AppFailure {
+            _groupProfileRetry['${conversation['id']}'] = DateTime.now().add(
+              const Duration(minutes: 5),
+            );
             // Directory lookup can still supply names when group scope is absent.
           }
         }
@@ -856,10 +901,11 @@ class Adapter {
           includeParentEnvironment: false,
         );
         streams[c['id']] = child;
-        child.stdout
-            .transform(utf8.decoder)
+        var errorTail = '';
+        final outputDone = child.stdout
+            .transform(const Utf8Decoder(allowMalformed: true))
             .transform(const LineSplitter())
-            .listen((line) {
+            .forEach((line) {
               try {
                 final j = object(unwrap(jsonDecode(line)));
                 emit({
@@ -870,17 +916,26 @@ class Adapter {
                     object(j['payload'] ?? j),
                   ).toJson(),
                 });
-              } catch (_) {
+              } catch (e) {
+                diagnostic(
+                  'event.decode',
+                  '消息事件解析失败：${e.runtimeType}',
+                  conversationId: '${c['id']}',
+                );
                 emit({
                   'method': 'sync.gap',
                   'params': {'conversationId': c['id'], 'reason': '事件解析失败，需补拉'},
                 });
               }
             });
-        child.stderr
-            .transform(utf8.decoder)
+        final errorDone = child.stderr
+            .transform(const Utf8Decoder(allowMalformed: true))
             .transform(const LineSplitter())
-            .listen((line) {
+            .forEach((line) {
+              errorTail += '$line\n';
+              if (errorTail.length > 16384) {
+                errorTail = errorTail.substring(errorTail.length - 16384);
+              }
               if (line.contains('ready')) {
                 emit({
                   'method': 'sync.ready',
@@ -888,20 +943,37 @@ class Adapter {
                 });
               }
             });
-        child.exitCode.then((code) {
+        unawaited(() async {
+          final code = await child.exitCode;
+          await Future.wait([outputDone, errorDone]);
+          // Explicit unsubscribe/shutdown must not trigger an error or reconnect.
+          if (!identical(streams[c['id']], child)) return;
           streams.remove(c['id']);
+          final detail = diagnosticText(errorTail);
+          diagnostic(
+            'event consume',
+            detail.isEmpty ? '订阅进程退出，没有错误输出' : detail,
+            exitCode: code,
+            conversationId: '${c['id']}',
+          );
           emit({
             'method': 'sync.gap',
-            'params': {'conversationId': c['id'], 'reason': '订阅已断开 ($code)'},
+            'params': {
+              'conversationId': c['id'],
+              'disconnected': true,
+              'reason': '订阅已断开 ($code)${detail.isEmpty ? '' : '：$detail'}',
+            },
           });
-        });
+        }());
         return {'started': true};
       case 'unsubscribe':
         final child = streams.remove(args['conversationId']);
         await child?.stdin.close();
         return {};
       case 'shutdown':
-        for (final child in streams.values.toList()) {
+        final subscriptions = streams.values.toList();
+        streams.clear();
+        for (final child in subscriptions) {
           await child.stdin.close();
         }
         for (final child in processes.values.toList()) {
@@ -938,6 +1010,9 @@ Future<void> main() async {
         final result = await adapter.handle(id, method, args);
         emit({'id': id, 'result': result});
       } catch (e) {
+        if (e is! AppFailure) {
+          adapter.diagnostic(method, '适配器错误：${e.runtimeType}');
+        }
         emit({
           'id': id,
           'error': e is AppFailure

@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../services/activity.dart';
 import 'app.dart';
@@ -82,6 +83,18 @@ class BackgroundActivityBar extends ConsumerWidget {
                     ),
                   ),
                 ),
+              IconButton(
+                tooltip: 'CLI 诊断记录',
+                onPressed: () => showDialog<void>(
+                  context: context,
+                  builder: (_) => const DiagnosticDialog(),
+                ),
+                icon: Badge(
+                  isLabelVisible: w.diagnostics.isNotEmpty,
+                  label: Text('${w.diagnostics.length}'),
+                  child: const Icon(Icons.bug_report_outlined, size: 18),
+                ),
+              ),
               const SizedBox(width: 8),
               const Icon(Icons.expand_less, size: 18),
             ],
@@ -194,6 +207,85 @@ class _BackgroundActivityDialogState
                   ? const Center(child: Text('暂无后台活动，自动同步开始后会在这里显示'))
                   : ListView(
                       children: [...running.map(entry), ...finished.map(entry)],
+                    ),
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => showDialog<void>(
+            context: context,
+            builder: (_) => const DiagnosticDialog(),
+          ),
+          child: const Text('CLI 诊断记录'),
+        ),
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('关闭'),
+        ),
+      ],
+    );
+  }
+}
+
+class DiagnosticDialog extends ConsumerWidget {
+  const DiagnosticDialog({super.key});
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final w = ref.watch(workspaceProvider);
+    return AlertDialog(
+      title: const Text('CLI 诊断记录'),
+      content: SizedBox(
+        width: 720,
+        height: 460,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text('本地保存最近 200 条错误摘要，重启后保留。敏感字段和链接已过滤。'),
+            const SizedBox(height: 12),
+            Expanded(
+              child: w.diagnostics.isEmpty
+                  ? const Center(child: Text('暂无 CLI 故障记录'))
+                  : ListView.builder(
+                      itemCount: w.diagnostics.length,
+                      itemBuilder: (context, index) {
+                        final row = w.diagnostics[index];
+                        final conversation = w.conversations
+                            .where(
+                              (c) =>
+                                  c.accountId == row['accountId'] &&
+                                  c.id == row['conversationId'],
+                            )
+                            .firstOrNull;
+                        final text = [
+                          '${messageTimeLabel(row['timestamp'] as int)} · ${row['account']}',
+                          '${row['operation']}${row['exitCode'] == null ? '' : ' · 退出码 ${row['exitCode']}'}',
+                          if (conversation != null) '会话：${conversation.title}',
+                          '${row['detail']}',
+                        ].join('\n');
+                        return SelectionArea(
+                          key: ValueKey((row['id'], text)),
+                          child: Card(
+                            child: Padding(
+                              padding: const EdgeInsets.all(12),
+                              child: Row(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Expanded(child: Text(text)),
+                                  IconButton(
+                                    tooltip: '复制诊断记录',
+                                    icon: const Icon(Icons.copy, size: 18),
+                                    onPressed: () => Clipboard.setData(
+                                      ClipboardData(text: text),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        );
+                      },
                     ),
             ),
           ],

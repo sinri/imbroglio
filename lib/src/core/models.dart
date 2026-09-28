@@ -204,16 +204,28 @@ class ResourceRef {
 }
 
 class SyncState {
-  String mode, error;
+  String mode;
+  String _error;
+  final pendingErrors = <String>[];
+  String get error => _error;
+  set error(String value) {
+    _error = value;
+    if (value.isNotEmpty && !pendingErrors.contains(value)) {
+      pendingErrors.add(value);
+    }
+  }
+
   int lastSuccess, failures;
   bool gap;
   SyncState({
     this.mode = '定时同步',
-    this.error = '',
+    String error = '',
     this.lastSuccess = 0,
     this.failures = 0,
     this.gap = false,
-  });
+  }) : _error = error {
+    if (error.isNotEmpty) pendingErrors.add(error);
+  }
   Json toJson() => {
     'mode': mode,
     'error': error,

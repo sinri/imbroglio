@@ -17,7 +17,7 @@ flowchart LR
 
 Flutter 使用 Riverpod 提供状态，Workspace 管理账号、会话、同步和插件生命周期。Drift 管理 SQLite；记录以账号和资源 ID 组合标识，防止不同组织同名 ID 混淆。FTS5 trigram 用于较长检索，短中文查询使用子串检索。
 
-官方 IM 通过随应用编译分发的 Dart 适配器转换命令与结构化输出。每个账号独立子进程，协议为逐行 JSON-RPC；stdout 只传协议，stderr 不直接显示，避免泄漏任意 CLI 诊断内容。第三方 IM 插件实现同一协议，Agent 插件声明提示词和允许工具。详细字段见 [插件协议](PLUGIN_PROTOCOL.md)。
+官方 IM 通过随应用编译分发的 Dart 适配器转换命令与结构化输出。每个账号独立子进程，协议为逐行 JSON-RPC；stdout 只传协议，stderr 收集有界尾部，退出时提取并脱敏错误摘要，通过诊断事件保存到本地数据库；不保存完整协议消息或业务响应。第三方 IM 插件实现同一协议，Agent 插件声明提示词和允许工具。详细字段见 [插件协议](PLUGIN_PROTOCOL.md)。
 
 ## 数据与凭证
 

@@ -21,7 +21,7 @@ Object? unwrap(Object? input) {
         (j['code'] is num && j['code'] != 0 && j['code'] != 200)) {
       throw AppFailure(
         'upstream',
-        '${object(j['error'])['message'] ?? j['message'] ?? j['msg'] ?? j['errmsg'] ?? '平台调用失败'}',
+        '${object(j['error'])['message'] ?? j['message'] ?? j['msg'] ?? j['errmsg'] ?? j['errorMsg'] ?? '平台调用失败'}',
       );
     }
     if (j.containsKey('data')) {
@@ -281,8 +281,21 @@ String findResourceId(Object? value, [int depth = 0]) {
         return value[key];
       }
     }
-    for (final child in value.values) {
-      final found = findResourceId(child, depth + 1);
+    for (final entry in value.entries) {
+      // Quoted messages and derived resource indexes can reference media that
+      // does not belong to this message's own content.
+      if (const {
+        'quotedMessage',
+        'resourceRefs',
+        'sender',
+        'senderAvatar',
+        'avatar',
+        'avatarUrl',
+        'avatar_url',
+      }.contains(entry.key)) {
+        continue;
+      }
+      final found = findResourceId(entry.value, depth + 1);
       if (found.isNotEmpty) return found;
     }
   }

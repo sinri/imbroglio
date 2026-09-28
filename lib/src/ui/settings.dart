@@ -559,7 +559,17 @@ Future<void> renameAccountDialog(
             initialValue: account.label,
             autofocus: true,
             enabled: !saving,
-            decoration: InputDecoration(labelText: '账号名称', errorText: error),
+            decoration: InputDecoration(
+              labelText: '账号名称',
+              errorText: error,
+              suffixIcon: error == null
+                  ? null
+                  : IconButton(
+                      tooltip: '关闭错误提示',
+                      onPressed: () => set(() => error = null),
+                      icon: const Icon(Icons.close),
+                    ),
+            ),
             onChanged: (value) => name = value,
           ),
         ),
@@ -578,17 +588,17 @@ Future<void> renameAccountDialog(
                     }
                     set(() {
                       saving = true;
-                      error = null;
                     });
                     try {
                       await workspace.renameAccount(account.id, name);
                       if (context.mounted) Navigator.pop(context);
                     } catch (e) {
-                      if (context.mounted)
+                      if (context.mounted) {
                         set(() {
                           saving = false;
                           error = '$e';
                         });
+                      }
                     }
                   },
             child: Text(saving ? '保存中' : '保存'),
@@ -719,9 +729,9 @@ class _AccountDialogState extends ConsumerState<_AccountDialog> {
                   child: LinearProgressIndicator(),
                 ),
               if (error != null)
-                Text(
-                  error!,
-                  style: TextStyle(color: Theme.of(context).colorScheme.error),
+                ErrorNotices(
+                  errors: [error!],
+                  onDismiss: (_) => setState(() => error = null),
                 ),
               if (status != null) ...[
                 const SizedBox(height: 12),
@@ -740,7 +750,6 @@ class _AccountDialogState extends ConsumerState<_AccountDialog> {
                         : () async {
                             setState(() {
                               busy = true;
-                              error = null;
                             });
                             try {
                               await w.connect(
@@ -776,7 +785,6 @@ class _AccountDialogState extends ConsumerState<_AccountDialog> {
               : () async {
                   setState(() {
                     busy = true;
-                    error = null;
                   });
                   try {
                     current ??= await w.addAccount(

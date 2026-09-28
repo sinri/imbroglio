@@ -9,6 +9,7 @@ import 'package:path_provider/path_provider.dart';
 import '../core/models.dart';
 import '../core/normalize.dart';
 import '../core/rpc.dart';
+import '../core/diagnostics.dart';
 import 'plugins.dart';
 import 'store.dart';
 import 'activity.dart';
@@ -19,7 +20,17 @@ class Workspace extends ChangeNotifier {
   late PluginManager plugins;
   late String root;
   bool ready = false, closing = false;
-  String? fatal, notice, selectedAccount;
+  String? fatal, selectedAccount;
+  final notices = <String>[];
+  String? get notice => notices.lastOrNull;
+  set notice(String? value) {
+    if (value == null) {
+      notices.clear();
+    } else if (!notices.contains(value)) {
+      notices.add(value);
+    }
+  }
+
   String startupStatus = '正在准备工作区…';
   void startupProgress(String message) {
     startupStatus = message;
@@ -44,6 +55,110 @@ class Workspace extends ChangeNotifier {
   final _backoff = <String, DateTime>{};
   final _next = <String, DateTime>{};
   final _streams = <String>{};
+  final blockedConversations = <String>{};
+  final diagnostics = <Json>[];
+  final _subscriptionRetry = <String, DateTime>{};
+  final _subscriptionFailures = <String, int>{};
+
+  Future<void> recordDiagnostic(AccountRef a, Json input) async {
+    if (closing) return;
+    final row = <String, dynamic>{
+      'id': newId(),
+      'accountId': a.id,
+      'account': a.label,
+      'timestamp': DateTime.now().millisecondsSinceEpoch,
+      'operation': diagnosticText('${input['operation'] ?? 'CLI'}'),
+      'detail': diagnosticText('${input['detail'] ?? ''}'),
+      'conversationId': '${input['conversationId'] ?? ''}',
+      if (input['exitCode'] is int) 'exitCode': input['exitCode'],
+    };
+    await store.db.transaction(() async {
+      await store.put(
+        'diagnostics',
+        row['id'],
+        row,
+        account: a.id,
+        ts: row['timestamp'],
+      );
+      final saved = await store.list('diagnostics', limit: 1000);
+      for (final old in saved.skip(200)) {
+        await store.remove('diagnostics', old['id']);
+      }
+      diagnostics
+        ..clear()
+        ..addAll(saved.take(200));
+    });
+    changed();
+  }
+
+  Future<void> loadSyncPolicies() async {
+    diagnostics
+      ..clear()
+      ..addAll(await store.list('diagnostics', limit: 200));
+    for (final row in await store.list('syncPolicies', limit: 100000)) {
+      final key = compositeKey(row['accountId'], row['conversationId']);
+      if (row['blocked'] == true) {
+        blockedConversations.add(key);
+        (sync[key] ??= SyncState())
+          ..mode = '保密群'
+          ..error = '保密群不支持读取消息，已停止拉取';
+      }
+    }
+    for (final row in await store.list('subscriptionRetry', limit: 100000)) {
+      final key = compositeKey(row['accountId'], row['conversationId']);
+      _subscriptionFailures[key] = row['failures'] as int? ?? 0;
+      _subscriptionRetry[key] = DateTime.fromMillisecondsSinceEpoch(
+        row['retryAt'] as int? ?? 0,
+      );
+    }
+  }
+
+  Future<void> _subscriptionFailed(
+    AccountRef a,
+    String conversationId,
+    String reason,
+  ) async {
+    final key = compositeKey(a.id, conversationId);
+    final failures = (_subscriptionFailures[key] ?? 0) + 1;
+    _subscriptionFailures[key] = failures;
+    final retry = DateTime.now().add(
+      Duration(
+        seconds: (30 * (1 << (failures - 1).clamp(0, 5))).clamp(30, 900),
+      ),
+    );
+    _subscriptionRetry[key] = retry;
+    final state = sync[key] ??= SyncState();
+    state.mode = '定时同步（订阅待重连）';
+    state.error = diagnosticText(reason);
+    activities
+        .begin('subscription:$key', '恢复实时订阅', a.label)
+        .finish(state: 'waiting', detail: state.error, retryAt: retry);
+    await store.put('subscriptionRetry', key, {
+      'accountId': a.id,
+      'conversationId': conversationId,
+      'failures': failures,
+      'retryAt': retry.millisecondsSinceEpoch,
+    }, account: a.id);
+  }
+
+  Future<void> _blockConfidential(Conversation c) async {
+    blockedConversations.add(c.key);
+    _streams.remove(c.key);
+    final state = sync[c.key] ??= SyncState();
+    state
+      ..mode = '保密群'
+      ..error = '保密群不支持读取消息，已停止拉取'
+      ..gap = false;
+    await store.put('syncPolicies', c.key, {
+      'accountId': c.accountId,
+      'conversationId': c.id,
+      'blocked': true,
+    }, account: c.accountId);
+    try {
+      await clients[c.accountId]?.call('unsubscribe', {'conversationId': c.id});
+    } catch (_) {}
+  }
+
   final _historyDone = <String>{};
   final senderProfiles = <String, Json>{};
   final _resolvingSenders = <String>{};
@@ -103,6 +218,7 @@ class Workspace extends ChangeNotifier {
         final cursor = await store.get('cursors', c.key);
         if (cursor?['historyDone'] == true) _historyDone.add(c.key);
       }
+      await loadSyncPolicies();
       startupProgress('正在载入插件与偏好设置…');
       final seeded = await store.get('settings', 'seeded');
       for (final file
@@ -223,6 +339,8 @@ class Workspace extends ChangeNotifier {
     if (closing) return;
     final params = object(event['params']);
     switch (event['method']) {
+      case 'diagnostic':
+        await recordDiagnostic(a, params);
       case 'auth.url':
         authUrls[a.id] = '${params['url']}';
         changed();
@@ -253,15 +371,32 @@ class Workspace extends ChangeNotifier {
         }
       case 'sync.ready':
         final key = compositeKey(a.id, '${params['conversationId']}');
+        if (blockedConversations.contains(key)) return;
+        final wasRetrying = _subscriptionFailures.remove(key) != null;
+        _subscriptionRetry.remove(key);
+        if (wasRetrying) {
+          activities
+              .begin('subscription:$key', '恢复实时订阅', a.label)
+              .finish(detail: '实时订阅已恢复');
+        }
+        await store.remove('subscriptionRetry', key);
         (sync[key] ??= SyncState()).mode = '实时订阅';
         changed();
       case 'sync.gap':
         final key = compositeKey(a.id, '${params['conversationId']}');
-        _streams.remove(key);
+        if (blockedConversations.contains(key)) return;
+        if (params['disconnected'] == true) {
+          _streams.remove(key);
+          await _subscriptionFailed(
+            a,
+            '${params['conversationId']}',
+            '${params['reason']}',
+          );
+        }
         final state = sync[key] ??= SyncState();
         state.gap = true;
-        state.error = '${params['reason']}';
-        state.mode = '补拉中';
+        state.error = diagnosticText('${params['reason']}');
+        if (params['disconnected'] != true) state.mode = '补拉中';
         _next.remove(key);
         changed();
     }
@@ -678,7 +813,7 @@ class Workspace extends ChangeNotifier {
   });
 
   Future<void> syncConversation(Conversation c, {bool older = false}) async {
-    if (!_busy.add(c.key)) return;
+    if (blockedConversations.contains(c.key) || !_busy.add(c.key)) return;
     final state = sync[c.key] ??= SyncState();
     BackgroundActivity? activity;
     var received = 0, fetchedPages = 0;
@@ -813,13 +948,19 @@ class Workspace extends ChangeNotifier {
       _backoff.remove(c.key);
       if (a.platform == 'dingtalk' &&
           (c.watched || c.key == selectedConversation?.key) &&
-          !_streams.contains(c.key)) {
+          !_streams.contains(c.key) &&
+          !(_subscriptionRetry[c.key]?.isAfter(DateTime.now()) ?? false)) {
         _streams.add(c.key);
         try {
           await rpc.call('subscribe', {'conversation': c.toJson()});
         } catch (e) {
           _streams.remove(c.key);
-          state.error = '$e';
+          await _subscriptionFailed(a, c.id, '$e');
+          await recordDiagnostic(a, {
+            'operation': 'subscribe',
+            'conversationId': c.id,
+            'detail': '$e',
+          });
         }
       }
       if (selectedConversation?.key == c.key && !closing) await loadMessages();
@@ -837,6 +978,17 @@ class Workspace extends ChangeNotifier {
         retryAt: state.gap ? _next[c.key] : null,
       );
     } catch (e) {
+      await recordDiagnostic(account(c.accountId), {
+        'operation': older ? 'messages.history' : 'messages',
+        'conversationId': c.id,
+        'detail': '$e',
+      });
+      if (e is AppFailure &&
+          (e.code == 'confidential_group' || confidentialFailure(e.message))) {
+        await _blockConfidential(c);
+        activity?.finish(state: 'waiting', detail: state.error);
+        return;
+      }
       state.failures++;
       state.error = '$e';
       state.mode = e is AppFailure && e.code == 'authorization'
@@ -857,6 +1009,7 @@ class Workspace extends ChangeNotifier {
       .where(
         (c) =>
             account(c.accountId).enabled &&
+            !blockedConversations.contains(c.key) &&
             !_historyDone.contains(c.key) &&
             (c.updatedAt == 0 ||
                 c.updatedAt >= historyCutoff ||
@@ -909,6 +1062,7 @@ class Workspace extends ChangeNotifier {
         .where(
           (c) =>
               available(c.accountId) &&
+              !blockedConversations.contains(c.key) &&
               (c.updatedAt == 0 ||
                   c.updatedAt >= historyCutoff ||
                   c.watched ||
@@ -961,32 +1115,26 @@ class Workspace extends ChangeNotifier {
     }
   }
 
+  Future<void> dismissSendError(String id) async {
+    final row = outbox.where((o) => o['id'] == id).firstOrNull;
+    if (row == null) return;
+    await _saveOutgoing({...row, 'errorDismissed': true});
+  }
+
+  Future<void> _saveOutgoing(Json record) async {
+    outbox = [record, ...outbox.where((o) => o['id'] != record['id'])];
+    changed();
+    await store.put(
+      'outbox',
+      record['id'],
+      record,
+      ts: record['timestamp'] as int,
+    );
+  }
+
   Future<void> send(
     Conversation c,
     String text, {
-    Message? reply,
-    String? attachment,
-    bool image = false,
-    bool markdown = false,
-  }) => activities.run(
-    'send:${newId()}',
-    '发送消息',
-    '${account(c.accountId).label} · ${c.title}',
-    (activity) => _send(
-      c,
-      text,
-      activity: activity,
-      reply: reply,
-      attachment: attachment,
-      image: image,
-      markdown: markdown,
-    ),
-  );
-
-  Future<void> _send(
-    Conversation c,
-    String text, {
-    required BackgroundActivity activity,
     Message? reply,
     String? attachment,
     bool image = false,
@@ -999,13 +1147,13 @@ class Workspace extends ChangeNotifier {
       'conversationId': c.id,
       'text': text,
       'state': 'sending',
+      'attachment': attachment,
+      'replyId': reply?.id,
       'timestamp': DateTime.now().millisecondsSinceEpoch,
     };
-    await store.put('outbox', id, record, ts: record['timestamp'] as int);
-    outbox = await store.list('outbox');
-    changed();
     _sendingAccounts[c.accountId] = (_sendingAccounts[c.accountId] ?? 0) + 1;
     try {
+      await _saveOutgoing(record);
       final result = await (await client(account(c.accountId))).call('send', {
         'conversation': c.toJson(),
         'text': text,
@@ -1016,11 +1164,7 @@ class Workspace extends ChangeNotifier {
         'idempotencyKey': id,
         'approved': true,
       });
-      await store.put('outbox', id, {
-        ...record,
-        'state': 'confirmed',
-        'result': result,
-      }, ts: record['timestamp'] as int);
+      await _saveOutgoing({...record, 'state': 'confirmed', 'result': result});
       await store.audit('message.send', {
         'account': c.accountId,
         'conversation': c.id,
@@ -1040,19 +1184,10 @@ class Workspace extends ChangeNotifier {
               ].contains(e.code)
           ? 'failed'
           : 'unknown';
-      activity.finish(
-        state: state,
-        detail: state == 'unknown' ? '发送结果未知，请先核对原平台：$e' : '$e',
-      );
-      await store.put('outbox', id, {
-        ...record,
-        'state': state,
-        'error': '$e',
-      }, ts: record['timestamp'] as int);
+      await _saveOutgoing({...record, 'state': state, 'error': '$e'});
       rethrow;
     } finally {
       _sendingAccounts[c.accountId] = (_sendingAccounts[c.accountId] ?? 1) - 1;
-      outbox = await store.list('outbox');
       changed();
     }
   }

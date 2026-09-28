@@ -723,10 +723,7 @@ void main() {
       );
       expect(calls, 1);
       expect((await w.store.list('outbox')).single['state'], 'unknown');
-      expect(
-        w.activities.items.firstWhere((e) => e.title == '发送消息').state,
-        'unknown',
-      );
+      expect(w.activities.items.where((e) => e.title == '发送消息'), isEmpty);
     },
   );
   test('rate limiting remains visible with no lost checkpoint', () async {

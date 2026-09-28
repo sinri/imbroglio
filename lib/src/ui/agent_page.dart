@@ -190,13 +190,10 @@ class _AgentPageState extends ConsumerState<AgentPage> {
                     ],
                   ),
           ),
-          if (agent.error.isNotEmpty)
-            Padding(
-              padding: const EdgeInsets.all(8),
-              child: Text(
-                agent.error,
-                style: TextStyle(color: Theme.of(context).colorScheme.error),
-              ),
+          if (agent.pendingErrors.isNotEmpty)
+            ErrorNotices(
+              errors: agent.pendingErrors,
+              onDismiss: agent.dismissError,
             ),
           if (agent.pending != null)
             Card(

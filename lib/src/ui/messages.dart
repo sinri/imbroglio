@@ -44,6 +44,60 @@ String senderAvatarPath(Workspace w, Message m) {
   return w.validSenderAvatarPath(m.accountId, path) ? path : '';
 }
 
+/// Merge local sends with platform echoes so each send occupies one timeline row.
+List<Message> messageTimeline(Workspace w, Conversation c) {
+  final messages = w.messages
+      .where((m) => m.accountId == c.accountId && m.conversationId == c.id)
+      .toList();
+  for (final row in w.outbox.where(
+    (o) => o['accountId'] == c.accountId && o['conversationId'] == c.id,
+  )) {
+    final remoteId = '${object(row['result'])['messageId'] ?? ''}';
+    final index = remoteId.isEmpty
+        ? -1
+        : messages.indexWhere(
+            (m) =>
+                m.id == remoteId ||
+                object(m.extra['raw'])['openMessageId'] == remoteId ||
+                object(m.extra['raw'])['messageId'] == remoteId,
+          );
+    final localKey = 'outbox:${row['id']}';
+    if (index >= 0) {
+      final message = messages[index];
+      messages[index] = Message.fromJson({
+        ...message.toJson(),
+        'extra': {...message.extra, 'timelineKey': localKey, 'isOwn': true},
+      });
+      continue;
+    }
+    final attachment = '${row['attachment'] ?? ''}';
+    messages.add(
+      Message(
+        accountId: c.accountId,
+        conversationId: c.id,
+        id: localKey,
+        text: [
+          if ('${row['text'] ?? ''}'.isNotEmpty) '${row['text']}',
+          if (attachment.isNotEmpty) '📎 ${p.basename(attachment)}',
+        ].join('\n'),
+        timestamp: row['timestamp'] as int? ?? 0,
+        sender: '我',
+        status: '${row['state']}',
+        extra: {
+          'isOwn': true,
+          'timelineKey': localKey,
+          'localSend': true,
+          'sendError': row['error'],
+          'errorDismissed': row['errorDismissed'],
+          'replyId': row['replyId'],
+        },
+      ),
+    );
+  }
+  messages.sort((a, b) => a.timestamp.compareTo(b.timestamp));
+  return messages;
+}
+
 class MessagesPage extends ConsumerStatefulWidget {
   final VoidCallback onSetup;
   const MessagesPage({super.key, required this.onSetup});
@@ -331,61 +385,75 @@ class _MessagesPageState extends ConsumerState<MessagesPage> {
                         ],
                       ),
                     ),
-                    if (state?.error.isNotEmpty == true)
-                      Container(
-                        width: double.infinity,
-                        color: scheme.errorContainer,
-                        padding: const EdgeInsets.all(10),
-                        child: Text(
-                          state!.error,
-                          style: TextStyle(
-                            color: scheme.onErrorContainer,
-                            fontSize: 12,
-                          ),
-                        ),
+                    if (state?.pendingErrors.isNotEmpty == true)
+                      ErrorNotices(
+                        errors: state!.pendingErrors,
+                        onDismiss: (error) {
+                          state.pendingErrors.remove(error);
+                          w.changed();
+                        },
                       ),
                     const Divider(),
                     Expanded(
-                      child: SelectionArea(
-                        child: NotificationListener<ScrollNotification>(
-                          onNotification: (notification) {
-                            if (notification is ScrollUpdateNotification &&
-                                notification.metrics.pixels > 0 &&
-                                notification.metrics.extentAfter < 100 &&
-                                !w.loadingEarlier) {
-                              w.showEarlierMessages();
-                            }
-                            return false;
-                          },
-                          child: ListView(
-                            key: PageStorageKey(c.key),
-                            reverse: true,
-                            padding: const EdgeInsets.all(22),
-                            children: [
-                              Center(
-                                child: TextButton.icon(
-                                  onPressed: () => guarded(
-                                    context,
-                                    () => w.showEarlierMessages(),
-                                  ),
-                                  icon: const Icon(Icons.history, size: 16),
-                                  label: Text(
-                                    w.loadingEarlier ? '加载中…' : '加载更早消息',
-                                  ),
+                      child: NotificationListener<ScrollNotification>(
+                        onNotification: (notification) {
+                          if (notification is ScrollUpdateNotification &&
+                              notification.metrics.pixels > 0 &&
+                              notification.metrics.extentAfter < 100 &&
+                              !w.loadingEarlier) {
+                            w.showEarlierMessages();
+                          }
+                          return false;
+                        },
+                        child: ListView(
+                          key: PageStorageKey(c.key),
+                          reverse: true,
+                          padding: const EdgeInsets.all(22),
+                          children: [
+                            Center(
+                              child: TextButton.icon(
+                                onPressed: () => guarded(
+                                  context,
+                                  () => w.showEarlierMessages(),
+                                ),
+                                icon: const Icon(Icons.history, size: 16),
+                                label: Text(
+                                  w.loadingEarlier ? '加载中…' : '加载更早消息',
                                 ),
                               ),
-                              ...w.messages.map(
-                                (m) => Padding(
-                                  key: ValueKey(m.key),
-                                  padding: const EdgeInsets.only(bottom: 20),
+                            ),
+                            ...messageTimeline(w, c).map(
+                              (m) => Padding(
+                                key: ValueKey<String>(
+                                  '${m.extra['timelineKey'] ?? m.key}',
+                                ),
+                                padding: const EdgeInsets.only(bottom: 20),
+                                // Keep selection out of the recycling timeline.
+                                // Content replacement gets a fresh selection delegate.
+                                child: SelectionArea(
+                                  key: ValueKey((
+                                    m.key,
+                                    m.text,
+                                    m.kind,
+                                    jsonEncode(m.extra),
+                                    w.messages
+                                        .where(
+                                          (other) =>
+                                              other.id == m.extra['replyId'],
+                                        )
+                                        .firstOrNull
+                                        ?.text,
+                                  )),
                                   child: Row(
                                     crossAxisAlignment:
                                         CrossAxisAlignment.start,
                                     children: [
-                                      SenderAvatar(
-                                        name: senderName(w, m),
-                                        url: senderAvatar(w, m),
-                                        path: senderAvatarPath(w, m),
+                                      SelectionContainer.disabled(
+                                        child: SenderAvatar(
+                                          name: senderName(w, m),
+                                          url: senderAvatar(w, m),
+                                          path: senderAvatarPath(w, m),
+                                        ),
                                       ),
                                       const SizedBox(width: 10),
                                       Expanded(
@@ -444,6 +512,29 @@ class _MessagesPageState extends ConsumerState<MessagesPage> {
                                           ],
                                         ),
                                       ),
+                                      if (m.status == 'sending')
+                                        const Padding(
+                                          padding: EdgeInsets.all(8),
+                                          child: Text('发送中…'),
+                                        ),
+                                      if ((m.status == 'failed' ||
+                                              m.status == 'unknown') &&
+                                          m.extra['errorDismissed'] != true)
+                                        SizedBox(
+                                          width: 220,
+                                          child: ErrorNotices(
+                                            errors: [
+                                              '${m.status == 'failed' ? '发送失败' : '发送结果未知，请核对原平台'}'
+                                                  '${m.extra['sendError'] == null ? '' : '：${m.extra['sendError']}'}',
+                                            ],
+                                            onDismiss: (_) =>
+                                                w.dismissSendError(
+                                                  m.id.substring(
+                                                    'outbox:'.length,
+                                                  ),
+                                                ),
+                                          ),
+                                        ),
                                       if (m.text.isNotEmpty)
                                         IconButton(
                                           tooltip: '复制消息',
@@ -467,60 +558,17 @@ class _MessagesPageState extends ConsumerState<MessagesPage> {
                                         ),
                                       IconButton(
                                         tooltip: '引用回复',
-                                        onPressed: () =>
-                                            setState(() => reply = m),
+                                        onPressed: m.extra['localSend'] == true
+                                            ? null
+                                            : () => setState(() => reply = m),
                                         icon: const Icon(Icons.reply, size: 18),
                                       ),
                                     ],
                                   ),
                                 ),
                               ),
-                              ...w.outbox
-                                  .where(
-                                    (o) =>
-                                        o['accountId'] == c.accountId &&
-                                        o['conversationId'] == c.id &&
-                                        !w.messages.any(
-                                          (m) =>
-                                              m.id ==
-                                              object(o['result'])['messageId'],
-                                        ),
-                                  )
-                                  .take(10)
-                                  .map(
-                                    (o) => ListTile(
-                                      dense: true,
-                                      leading: Icon(
-                                        o['state'] == 'confirmed'
-                                            ? Icons.check_circle_outline
-                                            : o['state'] == 'sending'
-                                            ? Icons.schedule
-                                            : Icons.error_outline,
-                                        size: 18,
-                                      ),
-                                      title: Text('${o['text']}'),
-                                      trailing: IconButton(
-                                        tooltip: '复制消息',
-                                        onPressed: () =>
-                                            copyMessage('${o['text']}'),
-                                        icon: const Icon(
-                                          Icons.copy_outlined,
-                                          size: 18,
-                                        ),
-                                      ),
-                                      subtitle: Text(
-                                        {
-                                              'sending': '发送中',
-                                              'confirmed': '已确认发送',
-                                              'failed': '发送失败',
-                                              'unknown': '结果未知，请刷新核对后再发送',
-                                            }[o['state']] ??
-                                            '${o['state']}',
-                                      ),
-                                    ),
-                                  ),
-                            ].reversed.toList(),
-                          ),
+                            ),
+                          ].reversed.toList(),
                         ),
                       ),
                     ),
@@ -601,7 +649,7 @@ class _MessagesPageState extends ConsumerState<MessagesPage> {
                               FilledButton.icon(
                                 onPressed: sending ? null : () => send(),
                                 icon: const Icon(Icons.arrow_upward, size: 18),
-                                label: Text(sending ? '发送中' : '发送'),
+                                label: const Text('发送'),
                               ),
                             ],
                           ),
@@ -644,7 +692,7 @@ class _MessagesPageState extends ConsumerState<MessagesPage> {
       reply = null;
       attachment = null;
     });
-    await guarded(context, () async {
+    try {
       await w.send(
         c,
         text,
@@ -658,8 +706,11 @@ class _MessagesPageState extends ConsumerState<MessagesPage> {
             ).hasMatch(previousAttachment),
         markdown: markdown,
       );
-    });
-    if (mounted) setState(() => sending = false);
+    } catch (_) {
+      // The send record retains the error next to its message.
+    } finally {
+      if (mounted) setState(() => sending = false);
+    }
   }
 
   Future<void> download(Message message) async {
@@ -718,7 +769,11 @@ class _MessagesPageState extends ConsumerState<MessagesPage> {
                     ),
                   ),
                 ),
-                if (error != null) Text(error!),
+                if (error != null)
+                  ErrorNotices(
+                    errors: [error!],
+                    onDismiss: (_) => set(() => error = null),
+                  ),
                 Expanded(
                   child: ListView(
                     children: results

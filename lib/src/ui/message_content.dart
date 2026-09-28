@@ -165,54 +165,56 @@ class _InlineMessageImageState extends ConsumerState<_InlineMessageImage> {
       Message.fromJson({...widget.message.toJson(), 'kind': 'image'}),
       widget.resourceId,
     );
-    return FutureBuilder<String>(
-      future: image,
-      builder: (context, snapshot) {
-        if (snapshot.hasError) {
-          return TextButton.icon(
-            onPressed: () => setState(() {
-              image = null;
-            }),
-            icon: const Icon(Icons.refresh),
-            label: const Text('图片加载失败，点击重试'),
-          );
-        }
-        if (!snapshot.hasData) {
-          return const SizedBox(
-            width: 180,
-            height: 80,
-            child: Center(child: CircularProgressIndicator()),
-          );
-        }
-        return InkWell(
-          onTap: () => showDialog<void>(
-            context: context,
-            builder: (context) => Dialog(
-              child: Stack(
-                children: [
-                  InteractiveViewer(
-                    child: Center(child: Image.file(File(snapshot.data!))),
-                  ),
-                  Positioned(
-                    right: 8,
-                    top: 8,
-                    child: IconButton(
-                      onPressed: () => Navigator.pop(context),
-                      icon: const Icon(Icons.close),
+    return SelectionContainer.disabled(
+      child: FutureBuilder<String>(
+        future: image,
+        builder: (context, snapshot) {
+          if (snapshot.hasError) {
+            return TextButton.icon(
+              onPressed: () => setState(() {
+                image = null;
+              }),
+              icon: const Icon(Icons.refresh),
+              label: const Text('图片加载失败，点击重试'),
+            );
+          }
+          if (!snapshot.hasData) {
+            return const SizedBox(
+              width: 180,
+              height: 80,
+              child: Center(child: CircularProgressIndicator()),
+            );
+          }
+          return InkWell(
+            onTap: () => showDialog<void>(
+              context: context,
+              builder: (context) => Dialog(
+                child: Stack(
+                  children: [
+                    InteractiveViewer(
+                      child: Center(child: Image.file(File(snapshot.data!))),
                     ),
-                  ),
-                ],
+                    Positioned(
+                      right: 8,
+                      top: 8,
+                      child: IconButton(
+                        onPressed: () => Navigator.pop(context),
+                        icon: const Icon(Icons.close),
+                      ),
+                    ),
+                  ],
+                ),
               ),
             ),
-          ),
-          child: Image.file(
-            File(snapshot.data!),
-            width: 300,
-            fit: BoxFit.contain,
-            errorBuilder: (_, _, _) => const Text('图片格式无法预览，可下载查看'),
-          ),
-        );
-      },
+            child: Image.file(
+              File(snapshot.data!),
+              width: 300,
+              fit: BoxFit.contain,
+              errorBuilder: (_, _, _) => const Text('图片格式无法预览，可下载查看'),
+            ),
+          );
+        },
+      ),
     );
   }
 }

@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'models.dart';
+import 'diagnostics.dart';
 
 /// One JSON-RPC object per line. stdout is exclusively protocol traffic.
 class RpcClient {
@@ -11,6 +12,7 @@ class RpcClient {
   int _sequence = 0;
   bool _closed = false;
   bool _exited = false;
+  bool _closing = false;
   bool get hasPending => _pending.isNotEmpty;
   RpcClient(this.process) {
     process.stdout
@@ -44,11 +46,31 @@ class RpcClient {
             _fail(const AppFailure('protocol', '插件返回了无效协议数据'));
           }
         }, onError: (Object e) => _fail(e));
-    process.stderr
-        .drain<void>(); // Never expose arbitrary plugin diagnostics/secrets.
-    process.exitCode.then((code) {
+    var errorTail = '';
+    final errorsDone = process.stderr
+        .transform(const Utf8Decoder(allowMalformed: true))
+        .forEach((chunk) {
+          errorTail += chunk;
+          if (errorTail.length > 16384) {
+            errorTail = errorTail.substring(errorTail.length - 16384);
+          }
+        });
+    process.exitCode.then((code) async {
       _exited = true;
       _fail(AppFailure('process_exit', '插件进程退出 ($code)'));
+      await errorsDone;
+      if (!_closed && !_closing) {
+        events.add({
+          'method': 'diagnostic',
+          'params': {
+            'operation': 'adapter.exit',
+            'exitCode': code,
+            'detail': diagnosticText(
+              errorTail.isEmpty ? '插件进程意外退出，没有错误输出' : errorTail,
+            ),
+          },
+        });
+      }
     });
   }
   Future<dynamic> call(
@@ -95,6 +117,7 @@ class RpcClient {
 
   Future<void> close() async {
     if (_closed) return;
+    _closing = true;
     try {
       await call('shutdown', {}, const Duration(seconds: 5));
     } catch (_) {

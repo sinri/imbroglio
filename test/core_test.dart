@@ -6,6 +6,34 @@ import 'package:imbroglio/src/core/normalize.dart';
 import 'package:imbroglio/src/services/agent.dart';
 
 void main() {
+  test('quoted images are not attachments of the current message', () {
+    final raw = {
+      'text': '当前消息只有文字',
+      'quotedMessage': {'content': '[图片消息](mediaId=quoted-image)'},
+      'resourceRefs': [
+        {'mediaId': 'quoted-image'},
+      ],
+      'sender': {
+        'avatar': {'mediaId': 'avatar-image'},
+      },
+    };
+    expect(findResourceId(raw), isEmpty);
+    expect(
+      findResourceId({...raw, 'body': '{"image_key":"own-image"}'}),
+      'own-image',
+    );
+    expect(
+      findResourceId({...raw, 'content': '[图片消息](mediaId=own-image)'}),
+      'own-image',
+    );
+    expect(
+      findResourceId({
+        'content': {'file_key': 'own-file'},
+      }),
+      'own-file',
+    );
+  });
+
   test('structured post keeps title, mentions and body without raw JSON', () {
     final message = normalizeMessage('a', 'c', {
       'message_id': 'm',

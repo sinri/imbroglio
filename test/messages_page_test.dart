@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:ui' show PointerDeviceKind;
 import 'package:drift/native.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -63,6 +64,26 @@ void main() {
     await tester.pumpAndSettle();
   }
 
+  testWidgets('sync errors survive recovery until manually closed', (
+    tester,
+  ) async {
+    final state = SyncState(error: '同步失败');
+    w.sync[chat.key] = state;
+    await open(tester);
+    expect(find.text('同步失败'), findsOneWidget);
+    state.error = '';
+    w.changed();
+    await tester.pumpAndSettle();
+    expect(find.text('同步失败'), findsOneWidget);
+    await tester.tap(find.byTooltip('关闭错误提示'));
+    await tester.pumpAndSettle();
+    expect(find.text('同步失败'), findsNothing);
+    state.error = '同步失败';
+    w.changed();
+    await tester.pumpAndSettle();
+    expect(find.text('同步失败'), findsOneWidget);
+  });
+
   testWidgets('text-only cached Markdown and rich nodes render automatically', (
     tester,
   ) async {
@@ -97,6 +118,21 @@ void main() {
         findsOneWidget,
       );
     }
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('text quoting an image has no download button', (tester) async {
+    await w.store.saveMessage(
+      normalizeMessage('a', 'c', {
+        'id': 'quoted-image-reply',
+        'text': '当前消息只有文字',
+        'quotedMessage': {'content': '[图片消息](mediaId=quoted-image)'},
+      }),
+    );
+    await open(tester);
+    expect(find.text('当前消息只有文字'), findsOneWidget);
+    expect(find.byTooltip('下载附件'), findsNothing);
+    expect(find.byTooltip('保存文件'), findsNothing);
     expect(tester.takeException(), isNull);
   });
 
@@ -259,6 +295,123 @@ void main() {
     });
   }
 
+  testWidgets(
+    'active selection survives timeline replacement without stale indices',
+    (tester) async {
+      await w.store.saveMessage(
+        const Message(
+          accountId: 'a',
+          conversationId: 'c',
+          id: 'selected',
+          text: '选中后替换消息列表',
+          timestamp: 1,
+        ),
+      );
+      await open(tester);
+      await tester.dragFrom(
+        tester.getTopLeft(find.text('选中后替换消息列表')) + const Offset(2, 10),
+        const Offset(130, 0),
+        kind: PointerDeviceKind.mouse,
+      );
+      await tester.pumpAndSettle();
+      w.messages = [];
+      w.changed();
+      await tester.pumpAndSettle();
+      expect(tester.takeException(), isNull);
+      w.messages = [
+        const Message(
+          accountId: 'a',
+          conversationId: 'c',
+          id: 'next',
+          text: '新的消息',
+          timestamp: 2,
+        ),
+      ];
+      w.changed();
+      await tester.pumpAndSettle();
+      await tester.dragFrom(
+        tester.getTopLeft(find.text('新的消息')) + const Offset(2, 10),
+        const Offset(60, 0),
+        kind: PointerDeviceKind.mouse,
+      );
+      await tester.pumpAndSettle();
+      w.selectedConversation = const Conversation(
+        accountId: 'a',
+        id: 'other',
+        title: '另一个会话',
+      );
+      w.conversations.add(w.selectedConversation!);
+      w.messages = [];
+      w.changed();
+      await tester.pumpAndSettle();
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets(
+    'selection belongs to each message and resets only when its content changes',
+    (tester) async {
+      const first = Message(
+        accountId: 'a',
+        conversationId: 'c',
+        id: 'stable',
+        text: '保持选择的正文',
+        timestamp: 1,
+      );
+      await w.store.saveMessage(first);
+      await open(tester);
+      Finder region() => find.ancestor(
+        of: find.text('保持选择的正文'),
+        matching: find.byType(SelectionArea),
+      );
+      final original = tester.state(region());
+      await tester.dragFrom(
+        tester.getTopLeft(find.text('保持选择的正文')) + const Offset(2, 10),
+        const Offset(110, 0),
+        kind: PointerDeviceKind.mouse,
+      );
+      await tester.pumpAndSettle();
+      w.changed();
+      await tester.pumpAndSettle();
+      expect(tester.state(region()), same(original));
+      w.messages = [
+        first,
+        const Message(
+          accountId: 'a',
+          conversationId: 'c',
+          id: 'incoming',
+          text: '后台收到新消息',
+          timestamp: 2,
+        ),
+      ];
+      w.changed();
+      await tester.pumpAndSettle();
+      expect(tester.state(region()), same(original));
+      expect(find.byType(SelectionArea), findsNWidgets(2));
+      w.messages = [
+        const Message(
+          accountId: 'a',
+          conversationId: 'c',
+          id: 'stable',
+          text: '**更新后的正文**',
+          kind: 'markdown',
+          timestamp: 1,
+        ),
+      ];
+      w.changed();
+      await tester.pumpAndSettle();
+      expect(tester.state(find.byType(SelectionArea)), isNot(same(original)));
+      expect(tester.takeException(), isNull);
+      await tester.drag(
+        find.byType(ListView).last,
+        const Offset(0, 500),
+        kind: PointerDeviceKind.mouse,
+      );
+      await tester.pumpAndSettle();
+      expect(tester.takeException(), isNull);
+    },
+  );
+
   testWidgets('message can be selected and copied, or copied with its button', (
     tester,
   ) async {
@@ -377,6 +530,75 @@ void main() {
     },
   );
 
+  testWidgets('failed send stays in its message row without a snackbar', (
+    tester,
+  ) async {
+    w.clients['a'] = FakeRpc(
+      (method, args) => throw const AppFailure('authorization', '无发送权限'),
+    );
+    await open(tester);
+    await tester.enterText(find.widgetWithText(TextField, '输入消息…'), '失败的消息');
+    await tester.tap(find.text('发送'));
+    await tester.runAsync(
+      () => Future<void>.delayed(const Duration(milliseconds: 100)),
+    );
+    await tester.pumpAndSettle();
+    final row = find.byKey(ValueKey('outbox:${w.outbox.single['id']}'));
+    expect(
+      find.descendant(of: row, matching: find.text('失败的消息')),
+      findsOneWidget,
+    );
+    expect(
+      find.descendant(of: row, matching: find.textContaining('发送失败')),
+      findsOneWidget,
+    );
+    expect(find.byType(SnackBar), findsNothing);
+    await tester.pump(const Duration(minutes: 10));
+    expect(find.textContaining('发送失败'), findsOneWidget);
+    await tester.tap(find.byTooltip('关闭错误提示'));
+    await tester.runAsync(
+      () => Future<void>.delayed(const Duration(milliseconds: 50)),
+    );
+    await tester.pumpAndSettle();
+    expect(find.textContaining('发送失败'), findsNothing);
+    expect(find.text('失败的消息'), findsOneWidget);
+    expect(w.outbox.single['state'], 'failed');
+  });
+
+  test(
+    'timeline merges platform aliases and does not truncate pending sends',
+    () {
+      w.outbox = List.generate(
+        12,
+        (i) => <String, dynamic>{
+          'id': '$i',
+          'accountId': 'a',
+          'conversationId': 'c',
+          'text': '消息$i',
+          'timestamp': i,
+          'state': 'confirmed',
+          'result': {'messageId': 'open-$i'},
+        },
+      );
+      w.messages = [
+        const Message(
+          accountId: 'a',
+          conversationId: 'c',
+          id: 'platform-id',
+          text: '消息0',
+          timestamp: 0,
+          extra: {
+            'raw': {'openMessageId': 'open-0'},
+          },
+        ),
+      ];
+      final timeline = messageTimeline(w, chat);
+      expect(timeline, hasLength(12));
+      expect(timeline.first.id, 'platform-id');
+      expect(timeline.first.extra['timelineKey'], 'outbox:0');
+    },
+  );
+
   testWidgets(
     'slow send keeps a later draft and displays sending state immediately',
     (tester) async {
@@ -391,6 +613,9 @@ void main() {
       );
       await tester.pump();
       expect(find.text('第一条'), findsOneWidget);
+      expect(find.text('发送中…'), findsOneWidget);
+      final rowKey = ValueKey('outbox:${w.outbox.single['id']}');
+      expect(find.byKey(rowKey), findsOneWidget);
       await tester.enterText(composer, '下一条草稿');
       result.complete({'messageId': 'sent'});
       await tester.runAsync(
@@ -398,6 +623,23 @@ void main() {
       );
       await tester.pumpAndSettle();
       expect(find.text('下一条草稿'), findsOneWidget);
+      expect(find.text('第一条'), findsOneWidget);
+      expect(find.text('发送中…'), findsNothing);
+      expect(find.text('已确认发送'), findsNothing);
+      expect(find.byKey(rowKey), findsOneWidget);
+      w.messages = [
+        const Message(
+          accountId: 'a',
+          conversationId: 'c',
+          id: 'sent',
+          text: '第一条',
+          timestamp: 1,
+        ),
+      ];
+      w.changed();
+      await tester.pumpAndSettle();
+      expect(find.text('第一条'), findsOneWidget);
+      expect(find.byKey(rowKey), findsOneWidget);
       expect(tester.takeException(), isNull);
     },
   );

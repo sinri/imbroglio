@@ -48,7 +48,14 @@ void main() {
     expect((await rpc.call('fast'))['method'], 'fast');
   });
   test('crashed process fails pending and future requests', () async {
+    final diagnostic = rpc.events.stream.firstWhere(
+      (e) => e['method'] == 'diagnostic',
+    );
     await expectLater(rpc.call('crash'), throwsA(isA<AppFailure>()));
+    final event = await diagnostic.timeout(const Duration(seconds: 5));
+    expect(event['params']['exitCode'], 7);
+    expect(event['params']['detail'], contains('fatal test failure'));
+    expect(event['params']['detail'], isNot(contains('hidden-secret')));
     await expectLater(rpc.call('fast'), throwsA(isA<AppFailure>()));
   });
 }

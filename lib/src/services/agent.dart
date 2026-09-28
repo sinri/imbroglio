@@ -126,7 +126,21 @@ class AgentController extends ChangeNotifier {
   Set<String>? sessionScope;
   final _attemptedWrites = <String>{};
   bool running = false, cancelled = false;
-  String error = '', streaming = '';
+  String _error = '', streaming = '';
+  final pendingErrors = <String>[];
+  String get error => _error;
+  set error(String value) {
+    _error = value;
+    if (value.isNotEmpty && !pendingErrors.contains(value)) {
+      pendingErrors.add(value);
+    }
+  }
+
+  void dismissError(String value) {
+    pendingErrors.remove(value);
+    notifyListeners();
+  }
+
   Json? pending;
   Completer<bool>? _confirmation;
   http.Client? _http;

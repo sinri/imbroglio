@@ -10,7 +10,10 @@ void main() {
       stdout.writeln(jsonEncode({'id': request['id'], 'result': {}}));
       exit(0);
     }
-    if (method == 'crash') exit(7);
+    if (method == 'crash') {
+      stderr.writeln('fatal test failure access_token=hidden-secret');
+      exit(7);
+    }
     if (method == 'hang' || method == 'cancel') return;
     Timer(
       Duration(milliseconds: method == 'slow' ? 40 : 1),

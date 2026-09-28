@@ -247,22 +247,13 @@ class _WorkspaceShellState extends ConsumerState<WorkspaceShell> {
                   ),
                 ),
                 const Divider(),
-                if (w.notice != null)
-                  MaterialBanner(
-                    content: Text(
-                      w.notice!,
-                      maxLines: 2,
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                    actions: [
-                      TextButton(
-                        onPressed: () {
-                          w.notice = null;
-                          w.changed();
-                        },
-                        child: const Text('关闭'),
-                      ),
-                    ],
+                if (w.notices.isNotEmpty)
+                  ErrorNotices(
+                    errors: w.notices,
+                    onDismiss: (error) {
+                      w.notices.remove(error);
+                      w.changed();
+                    },
                   ),
                 Expanded(
                   child: IndexedStack(
@@ -296,9 +287,63 @@ Future<void> guarded(
   } catch (e) {
     if (context.mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('$e'), duration: const Duration(seconds: 8)),
+        SnackBar(
+          content: SelectableText('$e'),
+          persist: true,
+          showCloseIcon: true,
+          dismissDirection: DismissDirection.none,
+        ),
       );
     }
+  }
+}
+
+/// Errors remain available until acknowledged, independently of retry status.
+class ErrorNotices extends StatelessWidget {
+  final List<String> errors;
+  final ValueChanged<String> onDismiss;
+  const ErrorNotices({
+    super.key,
+    required this.errors,
+    required this.onDismiss,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return ConstrainedBox(
+      constraints: const BoxConstraints(maxHeight: 160),
+      child: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            for (final error in errors)
+              Container(
+                color: scheme.errorContainer,
+                padding: const EdgeInsets.only(left: 10),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: SelectableText(
+                        error,
+                        style: TextStyle(
+                          color: scheme.onErrorContainer,
+                          fontSize: 12,
+                        ),
+                      ),
+                    ),
+                    IconButton(
+                      tooltip: '关闭错误提示',
+                      onPressed: () => onDismiss(error),
+                      icon: const Icon(Icons.close),
+                    ),
+                  ],
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
   }
 }
 
