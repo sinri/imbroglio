@@ -17,6 +17,12 @@ class Workspace extends ChangeNotifier {
   late String root;
   bool ready = false, closing = false;
   String? fatal, notice, selectedAccount;
+  String startupStatus = '正在准备工作区…';
+  void startupProgress(String message) {
+    startupStatus = message;
+    changed();
+  }
+
   Conversation? selectedConversation;
   List<AccountRef> accounts = [];
   List<Conversation> conversations = [];
@@ -42,6 +48,7 @@ class Workspace extends ChangeNotifier {
 
   Future<void> initialize({String? directory}) async {
     try {
+      startupProgress('正在准备本地数据目录…');
       root =
           directory ??
           p.join((await getApplicationSupportDirectory()).path, 'workspace');
@@ -54,18 +61,21 @@ class Workspace extends ChangeNotifier {
       } catch (_) {
         throw const AppFailure('already_running', '此工作区已有应用运行，请切换到已打开的窗口');
       }
+      startupProgress('正在打开消息数据库…');
       store = await Store.open(p.join(root, 'imbroglio.sqlite'));
       plugins = PluginManager(
         root,
         store,
         Abi.current().toString().contains('arm64') ? 'arm64' : 'amd64',
       );
+      startupProgress('正在载入账号与聊天记录…');
       accounts = (await store.list(
         'accounts',
       )).map(AccountRef.fromJson).toList();
       conversations = (await store.list(
         'conversations',
       )).map(Conversation.fromJson).toList();
+      startupProgress('正在载入插件与偏好设置…');
       final seeded = await store.get('settings', 'seeded');
       for (final file
           in seeded == null ? ['assistant', 'summary', 'tasks'] : <String>[]) {

@@ -1,34 +1,74 @@
 import 'dart:io';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:window_manager/window_manager.dart';
+import 'package:screen_retriever/screen_retriever.dart';
+import 'src/core/window_geometry.dart';
 import 'src/services/workspace.dart';
 import 'src/services/desktop.dart';
 import 'src/ui/app.dart';
+import 'src/services/startup.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   final workspace = Workspace();
-  await workspace.initialize();
-  if (Platform.isMacOS || Platform.isWindows || Platform.isLinux) {
-    await windowManager.ensureInitialized();
-    await windowManager.waitUntilReadyToShow(
-      const WindowOptions(
-        size: Size(1320, 860),
-        minimumSize: Size(960, 640),
-        title: 'Imbroglio',
-      ),
-      () async {
-        await windowManager.show();
-        await windowManager.focus();
-      },
-    );
-    if (workspace.ready) await DesktopIntegration(workspace).initialize();
-  }
   runApp(
     ProviderScope(
       overrides: [workspaceProvider.overrideWith((ref) => workspace)],
       child: const ImbroglioApp(),
     ),
   );
+  WidgetsBinding.instance.addPostFrameCallback((_) async {
+    await startWorkspace(
+      workspace,
+      directory: Platform.environment['IMBROGLIO_WORKSPACE'],
+      showWindow: () async {
+        await prepareWindow();
+        if (Platform.isMacOS) {
+          await const MethodChannel(
+            'imbroglio/startup',
+          ).invokeMethod<void>('flutterReady');
+        }
+        await windowManager.show();
+        await windowManager.focus();
+      },
+      initializeDesktop: () => DesktopIntegration(workspace).initialize(),
+    );
+  });
+}
+
+Future<void> prepareWindow() async {
+  if (Platform.isMacOS || Platform.isWindows || Platform.isLinux) {
+    await windowManager.ensureInitialized();
+    await windowManager.waitUntilReadyToShow(
+      const WindowOptions(title: 'Imbroglio'),
+    );
+    try {
+      final displays = await screenRetriever.getAllDisplays();
+      final cursor = await screenRetriever.getCursorScreenPoint();
+      final display =
+          displays
+              .where(
+                (d) =>
+                    ((d.visiblePosition ?? Offset.zero) &
+                            (d.visibleSize ?? d.size))
+                        .contains(cursor),
+              )
+              .firstOrNull ??
+          await screenRetriever.getPrimaryDisplay();
+      final bounds = initialWindowBounds(
+        (display.visiblePosition ?? Offset.zero) &
+            (display.visibleSize ?? display.size),
+      );
+      await windowManager.setMinimumSize(
+        Size(bounds.width.clamp(1, 960), bounds.height.clamp(1, 640)),
+      );
+      await windowManager.setBounds(bounds);
+    } catch (_) {
+      // Keep startup usable if the platform cannot report its work area.
+      await windowManager.setSize(const Size(960, 640));
+      await windowManager.center();
+    }
+  }
 }

@@ -54,6 +54,25 @@ class ImbroglioApp extends ConsumerWidget {
     theme: theme(Brightness.light),
     darkTheme: theme(Brightness.dark),
     themeMode: ref.watch(themeProvider),
+    builder: (context, child) => LayoutBuilder(
+      builder: (context, box) {
+        if (box.maxWidth >= 960 && box.maxHeight >= 640) return child!;
+        final size = Size(
+          box.maxWidth < 960 ? 960 : box.maxWidth,
+          box.maxHeight < 640 ? 640 : box.maxHeight,
+        );
+        return FittedBox(
+          fit: BoxFit.contain,
+          child: SizedBox.fromSize(
+            size: size,
+            child: MediaQuery(
+              data: MediaQuery.of(context).copyWith(size: size),
+              child: child!,
+            ),
+          ),
+        );
+      },
+    ),
     home: const WorkspaceShell(),
   );
 }
@@ -81,7 +100,30 @@ class _WorkspaceShellState extends ConsumerState<WorkspaceShell> {
       );
     }
     if (!w.ready) {
-      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+      return Scaffold(
+        body: Center(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(Icons.hub_outlined, size: 48, color: color.primary),
+              const SizedBox(height: 20),
+              Text(
+                'Imbroglio',
+                style: Theme.of(context).textTheme.headlineMedium,
+              ),
+              const SizedBox(height: 24),
+              const CircularProgressIndicator(),
+              const SizedBox(height: 20),
+              const Text('正在加载，请稍候'),
+              const SizedBox(height: 8),
+              Text(
+                w.startupStatus,
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
+            ],
+          ),
+        ),
+      );
     }
     return Scaffold(
       body: Row(
