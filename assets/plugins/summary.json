@@ -1,0 +1,21 @@
+{
+  "id": "imbroglio.summary",
+  "name": "会话总结",
+  "version": "1.0.0",
+  "kind": "agent",
+  "protocol": 1,
+  "prompt": "总结用户指定会话，区分事实、决定、风险和待确认事项，注明来源与时间范围。",
+  "tools": [
+    "search",
+    "read_source",
+    "conversations",
+    "history",
+    "contacts"
+  ],
+  "workflow": [
+    "retrieve",
+    "analyze",
+    "confirm_writes",
+    "report"
+  ]
+}

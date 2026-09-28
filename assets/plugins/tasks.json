@@ -1,0 +1,22 @@
+{
+  "id": "imbroglio.tasks",
+  "name": "待办提取",
+  "version": "1.0.0",
+  "kind": "agent",
+  "protocol": 1,
+  "prompt": "从消息和文档中提取任务、责任人与期限，未知项明确标注。先展示清单，经确认后创建待办。",
+  "tools": [
+    "search",
+    "read_source",
+    "conversations",
+    "history",
+    "contacts",
+    "create_task"
+  ],
+  "workflow": [
+    "retrieve",
+    "analyze",
+    "confirm_writes",
+    "report"
+  ]
+}

@@ -1,0 +1,6 @@
+#include "../../Flutter/Flutter-Release.xcconfig"
+#include "Warnings.xcconfig"
+
+// The bundled CLI adapter is compiled for the build host. CI produces a
+// separate archive for each CPU rather than a partially universal bundle.
+ARCHS = $(NATIVE_ARCH_ACTUAL)

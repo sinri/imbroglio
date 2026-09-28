@@ -1,0 +1,6 @@
+name: imbroglio_adapter_build
+publish_to: none
+environment:
+  sdk: ^3.11.3
+dependencies:
+  path: ^1.9.1

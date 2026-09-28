@@ -1,0 +1,24 @@
+{
+  "id": "imbroglio.assistant",
+  "name": "通用工作助手",
+  "version": "1.0.0",
+  "kind": "agent",
+  "protocol": 1,
+  "prompt": "协助用户理解消息和资料，并完成经确认的业务操作。回答简明，引用真实来源。",
+  "tools": [
+    "search",
+    "read_source",
+    "conversations",
+    "history",
+    "contacts",
+    "send_message",
+    "create_document",
+    "create_task"
+  ],
+  "workflow": [
+    "retrieve",
+    "analyze",
+    "confirm_writes",
+    "report"
+  ]
+}
