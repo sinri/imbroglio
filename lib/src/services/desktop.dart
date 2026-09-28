@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:local_notifier/local_notifier.dart';
 import 'package:tray_manager/tray_manager.dart';
 import 'package:window_manager/window_manager.dart';
@@ -9,6 +11,8 @@ class DesktopIntegration with WindowListener {
   DesktopIntegration(this.workspace);
   Future<void> initialize() async {
     windowManager.addListener(this);
+    // macOS can restore the window from the Dock even without a tray icon.
+    if (Platform.isMacOS) await windowManager.setPreventClose(true);
     workspace.windowFocused = await windowManager.isFocused();
     try {
       await localNotifier.setup(
@@ -72,8 +76,12 @@ class DesktopIntegration with WindowListener {
         if (event is MenuItemClickedEvent) {
           await workspace.close();
           icon?.dispose();
-          await windowManager.setPreventClose(false);
-          await windowManager.close();
+          if (Platform.isMacOS) {
+            await windowManager.destroy();
+          } else {
+            await windowManager.setPreventClose(false);
+            await windowManager.close();
+          }
         }
       });
       menu.addItem(quit);
@@ -84,7 +92,9 @@ class DesktopIntegration with WindowListener {
       });
       await windowManager.setPreventClose(true);
     } catch (_) {
-      workspace.notice = '托盘不可用，关闭窗口将退出应用';
+      workspace.notice = Platform.isMacOS
+          ? '托盘不可用，可点击 Dock 图标重新打开窗口'
+          : '托盘不可用，关闭窗口将退出应用';
     }
   }
 
@@ -105,6 +115,6 @@ class DesktopIntegration with WindowListener {
 
   @override
   void onWindowClose() async {
-    if (icon != null) await windowManager.hide();
+    if (Platform.isMacOS || icon != null) await windowManager.hide();
   }
 }
