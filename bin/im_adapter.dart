@@ -366,7 +366,10 @@ class Adapter {
             'page_token',
             'next_page_token',
           ]),
-          'hasMore': object(value)['has_more'] ?? items.length == 50,
+          'hasMore':
+              object(value)['has_more'] ??
+              object(value)['hasMore'] ??
+              items.length == 50,
         };
       case 'send':
         if (args['approved'] != true) {
@@ -650,6 +653,102 @@ class Adapter {
                 ], user: true),
         );
         return {'text': bodyText(value)};
+      case 'contacts.resolve':
+        final ids = (args['ids'] as List? ?? [])
+            .whereType<String>()
+            .take(20)
+            .toList();
+        if (ids.isEmpty) return {'items': []};
+        final openIds = object(args['openIds']);
+        final conversation = object(args['conversation']);
+        final profiles = <String, Json>{};
+        if (platform == 'dingtalk' &&
+            conversation['kind'] == 'group' &&
+            openIds.isNotEmpty) {
+          try {
+            final value = await run(
+              id,
+              scoped([
+                'chat',
+                'group',
+                'members',
+                'list-by-ids',
+                '--id',
+                conversation['id'],
+                '--users',
+                ids
+                    .where((id) => openIds[id] != null)
+                    .map((id) => openIds[id])
+                    .join(','),
+              ]),
+            );
+            for (final j in rows(value)) {
+              final openId = field(j, ['openDingTalkId', 'openDingtalkId']);
+              final profile = normalizeSenderProfile(j);
+              final matching = ids
+                  .where(
+                    (id) =>
+                        id == profile['id'] ||
+                        (openId.isNotEmpty && openIds[id] == openId),
+                  )
+                  .firstOrNull;
+              if (matching != null) {
+                profiles[matching] = {...profile, 'id': matching};
+              }
+            }
+          } on AppFailure {
+            // Directory lookup can still supply names when group scope is absent.
+          }
+        }
+        final remaining = ids
+            .where(
+              (id) =>
+                  profiles[id] == null ||
+                  profiles[id]!['name'] == '' ||
+                  (profiles[id]!['avatar'] == '' &&
+                      profiles[id]!['avatarResourceId'] == null),
+            )
+            .toList();
+        if (remaining.isNotEmpty) {
+          try {
+            final value = await run(
+              id,
+              platform == 'dingtalk'
+                  ? scoped([
+                      'contact',
+                      'user',
+                      'get',
+                      '--ids',
+                      remaining.join(','),
+                    ])
+                  : scoped([
+                      'contact',
+                      '+search-user',
+                      '--user-ids',
+                      remaining.join(','),
+                    ], user: true),
+            );
+            for (final j in rows(value)) {
+              final profile = normalizeSenderProfile(j);
+              final id = '${profile['id']}';
+              if (!ids.contains(id)) continue;
+              final previous = profiles[id] ?? <String, dynamic>{};
+              profiles[id] = {
+                'id': id,
+                'name': field(previous, ['name'], '${profile['name']}'),
+                'avatar': field(previous, ['avatar'], '${profile['avatar']}'),
+                if (previous['avatarResourceId'] != null ||
+                    profile['avatarResourceId'] != null)
+                  'avatarResourceId':
+                      previous['avatarResourceId'] ??
+                      profile['avatarResourceId'],
+              };
+            }
+          } on AppFailure {
+            if (profiles.isEmpty) rethrow;
+          }
+        }
+        return {'items': profiles.values.toList()};
       case 'contacts':
         return {
           'items': rows(

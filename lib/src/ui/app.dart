@@ -6,6 +6,7 @@ import 'messages.dart';
 import 'search.dart';
 import 'agent_page.dart';
 import 'settings.dart';
+import 'activity.dart';
 
 final workspaceProvider = ChangeNotifierProvider<Workspace>(
   (ref) => Workspace()..initialize(),
@@ -86,6 +87,16 @@ class WorkspaceShell extends ConsumerStatefulWidget {
 class _WorkspaceShellState extends ConsumerState<WorkspaceShell> {
   int page = 0;
   @override
+  void initState() {
+    super.initState();
+    ref.read(workspaceProvider).requestMessagesPage = () {
+      if (!mounted) return;
+      setState(() => page = 0);
+      ref.read(workspaceProvider).updateReading(visible: true);
+    };
+  }
+
+  @override
   Widget build(BuildContext context) {
     final w = ref.watch(workspaceProvider),
         color = Theme.of(context).colorScheme;
@@ -149,7 +160,10 @@ class _WorkspaceShellState extends ConsumerState<WorkspaceShell> {
                     backgroundColor: Colors.transparent,
                     selectedIndex: page,
                     labelType: NavigationRailLabelType.all,
-                    onDestinationSelected: (i) => setState(() => page = i),
+                    onDestinationSelected: (i) {
+                      setState(() => page = i);
+                      w.updateReading(visible: i == 0);
+                    },
                     destinations: const [
                       NavigationRailDestination(
                         icon: Icon(Icons.forum_outlined),
@@ -262,6 +276,8 @@ class _WorkspaceShellState extends ConsumerState<WorkspaceShell> {
                     ],
                   ),
                 ),
+                const Divider(height: 1),
+                const BackgroundActivityBar(),
               ],
             ),
           ),
@@ -323,7 +339,14 @@ Widget emptyState(
   ),
 );
 String timeLabel(int timestamp) {
-  if (timestamp == 0) return '尚未同步';
+  if (timestamp <= 0) return '时间未知';
   final d = DateTime.fromMillisecondsSinceEpoch(timestamp);
   return '${d.month}/${d.day} ${d.hour.toString().padLeft(2, '0')}:${d.minute.toString().padLeft(2, '0')}';
+}
+
+String messageTimeLabel(int timestamp) {
+  if (timestamp <= 0) return '发送时间未知';
+  final d = DateTime.fromMillisecondsSinceEpoch(timestamp).toLocal();
+  String two(int n) => n.toString().padLeft(2, '0');
+  return '${d.year}-${two(d.month)}-${two(d.day)} ${two(d.hour)}:${two(d.minute)}:${two(d.second)}';
 }

@@ -13,6 +13,69 @@ void main() {
     await store.close();
   });
   test(
+    'legacy message times are restored before sorting and survive another startup',
+    () async {
+      for (var i = 0; i < 205; i++) {
+        final m = Message(
+          accountId: 'a',
+          conversationId: 'c',
+          id: 'm$i',
+          text: 'history',
+          timestamp: 0,
+          extra: {
+            'raw': {'createTime': 1700000000000 + i * 1000},
+          },
+        );
+        await store.saveMessage(m);
+      }
+      const missing = Message(
+        accountId: 'a',
+        conversationId: 'c',
+        id: 'missing',
+        text: '',
+        timestamp: 0,
+      );
+      await store.saveMessage(missing);
+      await store.put('readState', 'read', {'timestamp': 1700000200000});
+      await store.init();
+      final latest = (await store.list(
+        'messages',
+        account: 'a',
+        conversation: 'c',
+        limit: 1,
+      )).single;
+      expect(latest['id'], 'm204');
+      expect(latest['timestamp'], 1700000204000);
+      expect(await store.oldestMessage('a', 'c'), 0);
+      expect((await store.get('messages', missing.key))!['timestamp'], 0);
+      expect(
+        (await store.get('readState', 'read'))!['timestamp'],
+        1700000200000,
+      );
+      await store.init();
+      expect((await store.list('messages', limit: 1)).single, latest);
+    },
+  );
+
+  test(
+    'concurrent event and polling arrivals claim notification only once',
+    () async {
+      const message = Message(
+        accountId: 'a',
+        conversationId: 'c',
+        id: 'same',
+        text: 'new',
+        timestamp: 1,
+      );
+      final fresh = await Future.wait([
+        store.saveIncoming(message),
+        store.saveIncoming(message),
+      ]);
+      expect(fresh.where((value) => value).length, 1);
+      expect((await store.list('messages')).length, 1);
+    },
+  );
+  test(
     'duplicate event/history messages upsert without account leakage',
     () async {
       for (final account in ['a', 'b']) {

@@ -1,5 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
+import 'package:flutter/services.dart';
+import 'package:path/path.dart' as p;
 import '../core/normalize.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
@@ -7,6 +9,40 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../core/models.dart';
 import 'app.dart';
 import 'agent_page.dart';
+import 'message_content.dart';
+import '../services/workspace.dart';
+
+String senderName(Workspace w, Message m) {
+  if (m.extra['isOwn'] == true ||
+      (w.account(m.accountId).userId.isNotEmpty &&
+          w.account(m.accountId).userId == m.senderId)) {
+    return '我';
+  }
+  final profile =
+      w.senderProfiles[compositeKey(m.accountId, senderLookupId(m))];
+  final resolved = '${profile?['name'] ?? ''}'.trim();
+  return resolved.isNotEmpty
+      ? resolved
+      : (messageSenderName(m).isNotEmpty
+            ? messageSenderName(m)
+            : m.senderId.isNotEmpty
+            ? m.senderId
+            : '未知发送者');
+}
+
+String senderAvatar(Workspace w, Message m) {
+  final profile =
+      w.senderProfiles[compositeKey(m.accountId, senderLookupId(m))];
+  final resolved = avatarUrl(profile?['avatar']);
+  return resolved.isNotEmpty ? resolved : messageSenderAvatar(m);
+}
+
+String senderAvatarPath(Workspace w, Message m) {
+  final profile =
+      w.senderProfiles[compositeKey(m.accountId, senderLookupId(m))];
+  final path = '${profile?['avatarPath'] ?? ''}';
+  return w.validSenderAvatarPath(m.accountId, path) ? path : '';
+}
 
 class MessagesPage extends ConsumerStatefulWidget {
   final VoidCallback onSetup;
@@ -142,6 +178,7 @@ class _MessagesPageState extends ConsumerState<MessagesPage> {
                         itemBuilder: (context, index) {
                           final chat = conversations[index];
                           return Padding(
+                            key: ValueKey(chat.key),
                             padding: const EdgeInsets.symmetric(
                               horizontal: 8,
                               vertical: 2,
@@ -176,7 +213,14 @@ class _MessagesPageState extends ConsumerState<MessagesPage> {
                                 style: const TextStyle(fontSize: 11),
                               ),
                               trailing: chat.unread > 0
-                                  ? Badge(label: Text('${chat.unread}'))
+                                  ? Tooltip(
+                                      message: chat.unreadIsLocal
+                                          ? '本应用未读（原平台未提供已读状态）'
+                                          : '平台未读',
+                                      child: Badge(
+                                        label: Text('${chat.unread}'),
+                                      ),
+                                    )
                                   : null,
                               onTap: () => guarded(
                                 context,
@@ -187,6 +231,14 @@ class _MessagesPageState extends ConsumerState<MessagesPage> {
                         },
                       ),
               ),
+              if (w.backgroundPending > 0)
+                Padding(
+                  padding: const EdgeInsets.all(8),
+                  child: Text(
+                    '自动补齐近三个月历史 · ${w.backgroundPending} 个会话',
+                    style: Theme.of(context).textTheme.labelSmall,
+                  ),
+                ),
               TextButton(
                 onPressed: () => guarded(context, () async {
                   if (w.selectedAccount != null) {
@@ -208,7 +260,7 @@ class _MessagesPageState extends ConsumerState<MessagesPage> {
                   context,
                   Icons.chat_bubble_outline,
                   '选择一个会话',
-                  '消息只在已授权的范围内同步。关注会话可保持后台同步。',
+                  '近期会话自动同步，选择会话即可阅读。',
                 )
               : Column(
                   children: [
@@ -231,7 +283,7 @@ class _MessagesPageState extends ConsumerState<MessagesPage> {
                                 ),
                                 const SizedBox(height: 4),
                                 Text(
-                                  '${w.account(c.accountId).label} · 用户身份 · ${state?.mode ?? '定时同步'} · ${timeLabel(state?.lastSuccess ?? 0)}',
+                                  '${w.account(c.accountId).label} · 用户身份 · ${state?.mode ?? '定时同步'} · ${(state?.lastSuccess ?? 0) == 0 ? '尚未同步' : '最近同步 ${timeLabel(state!.lastSuccess)}'}',
                                   style: Theme.of(context).textTheme.bodySmall,
                                 ),
                               ],
@@ -294,125 +346,182 @@ class _MessagesPageState extends ConsumerState<MessagesPage> {
                       ),
                     const Divider(),
                     Expanded(
-                      child: ListView(
-                        padding: const EdgeInsets.all(22),
-                        children: [
-                          Center(
-                            child: TextButton.icon(
-                              onPressed: () => guarded(
-                                context,
-                                () => w.syncConversation(c, older: true),
-                              ),
-                              icon: const Icon(Icons.history, size: 16),
-                              label: const Text('加载更早消息'),
-                            ),
-                          ),
-                          ...w.messages.map(
-                            (m) => Padding(
-                              key: ValueKey(m.key),
-                              padding: const EdgeInsets.only(bottom: 20),
-                              child: Row(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  CircleAvatar(
-                                    radius: 16,
-                                    backgroundColor: scheme.secondaryContainer,
-                                    child: Text(
-                                      m.sender.isEmpty
-                                          ? '?'
-                                          : String.fromCharCode(
-                                              m.sender.runes.first,
-                                            ),
-                                      style: const TextStyle(fontSize: 12),
-                                    ),
+                      child: SelectionArea(
+                        child: NotificationListener<ScrollNotification>(
+                          onNotification: (notification) {
+                            if (notification is ScrollUpdateNotification &&
+                                notification.metrics.pixels > 0 &&
+                                notification.metrics.extentAfter < 100 &&
+                                !w.loadingEarlier) {
+                              w.showEarlierMessages();
+                            }
+                            return false;
+                          },
+                          child: ListView(
+                            key: PageStorageKey(c.key),
+                            reverse: true,
+                            padding: const EdgeInsets.all(22),
+                            children: [
+                              Center(
+                                child: TextButton.icon(
+                                  onPressed: () => guarded(
+                                    context,
+                                    () => w.showEarlierMessages(),
                                   ),
-                                  const SizedBox(width: 10),
-                                  Expanded(
-                                    child: Column(
-                                      crossAxisAlignment:
-                                          CrossAxisAlignment.start,
-                                      children: [
-                                        Text(
-                                          '${m.sender.isEmpty ? m.senderId : m.sender}  ·  ${timeLabel(m.timestamp)}',
-                                          style: Theme.of(
-                                            context,
-                                          ).textTheme.labelSmall,
-                                        ),
-                                        const SizedBox(height: 6),
-                                        Container(
-                                          padding: const EdgeInsets.all(14),
-                                          decoration: BoxDecoration(
-                                            color: scheme.surfaceContainerLow,
-                                            borderRadius: BorderRadius.circular(
-                                              12,
-                                            ),
-                                          ),
-                                          child: SelectableText(
-                                            m.text.isEmpty
-                                                ? '[${m.kind}]'
-                                                : m.text,
-                                            style: const TextStyle(height: 1.6),
-                                          ),
-                                        ),
-                                        if (m.kind != 'text')
-                                          Text(
-                                            m.kind,
-                                            style: Theme.of(
-                                              context,
-                                            ).textTheme.labelSmall,
-                                          ),
-                                      ],
-                                    ),
-                                  ),
-                                  if (findResourceId(m.extra['raw']).isNotEmpty)
-                                    IconButton(
-                                      tooltip: '下载附件',
-                                      icon: const Icon(
-                                        Icons.download_outlined,
-                                        size: 18,
-                                      ),
-                                      onPressed: () => download(m),
-                                    ),
-                                  IconButton(
-                                    tooltip: '引用回复',
-                                    onPressed: () => setState(() => reply = m),
-                                    icon: const Icon(Icons.reply, size: 18),
-                                  ),
-                                ],
-                              ),
-                            ),
-                          ),
-                          ...w.outbox
-                              .where(
-                                (o) =>
-                                    o['accountId'] == c.accountId &&
-                                    o['conversationId'] == c.id,
-                              )
-                              .take(10)
-                              .map(
-                                (o) => ListTile(
-                                  dense: true,
-                                  leading: Icon(
-                                    o['state'] == 'confirmed'
-                                        ? Icons.check_circle_outline
-                                        : o['state'] == 'sending'
-                                        ? Icons.schedule
-                                        : Icons.error_outline,
-                                    size: 18,
-                                  ),
-                                  title: Text('${o['text']}', maxLines: 2),
-                                  subtitle: Text(
-                                    {
-                                          'sending': '发送中',
-                                          'confirmed': '已确认发送',
-                                          'failed': '发送失败',
-                                          'unknown': '结果未知，请刷新核对后再发送',
-                                        }[o['state']] ??
-                                        '${o['state']}',
+                                  icon: const Icon(Icons.history, size: 16),
+                                  label: Text(
+                                    w.loadingEarlier ? '加载中…' : '加载更早消息',
                                   ),
                                 ),
                               ),
-                        ],
+                              ...w.messages.map(
+                                (m) => Padding(
+                                  key: ValueKey(m.key),
+                                  padding: const EdgeInsets.only(bottom: 20),
+                                  child: Row(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: [
+                                      SenderAvatar(
+                                        name: senderName(w, m),
+                                        url: senderAvatar(w, m),
+                                        path: senderAvatarPath(w, m),
+                                      ),
+                                      const SizedBox(width: 10),
+                                      Expanded(
+                                        child: Column(
+                                          crossAxisAlignment:
+                                              CrossAxisAlignment.start,
+                                          children: [
+                                            Text(
+                                              '${senderName(w, m)}  ·  ${messageTimeLabel(m.timestamp)}',
+                                              style: Theme.of(
+                                                context,
+                                              ).textTheme.labelSmall,
+                                            ),
+                                            const SizedBox(height: 6),
+                                            Container(
+                                              padding: const EdgeInsets.all(14),
+                                              decoration: BoxDecoration(
+                                                color:
+                                                    scheme.surfaceContainerLow,
+                                                borderRadius:
+                                                    BorderRadius.circular(12),
+                                              ),
+                                              child: Column(
+                                                crossAxisAlignment:
+                                                    CrossAxisAlignment.start,
+                                                children: [
+                                                  if ('${m.extra['replyId'] ?? ''}'
+                                                      .isNotEmpty)
+                                                    Padding(
+                                                      padding:
+                                                          const EdgeInsets.only(
+                                                            bottom: 8,
+                                                          ),
+                                                      child: Text(
+                                                        '回复：${w.messages.where((other) => other.id == m.extra['replyId']).firstOrNull?.text ?? '原消息尚未缓存'}',
+                                                        style: Theme.of(
+                                                          context,
+                                                        ).textTheme.labelSmall,
+                                                      ),
+                                                    ),
+                                                  MessageContent(
+                                                    m,
+                                                    onDownload: () =>
+                                                        download(m),
+                                                  ),
+                                                ],
+                                              ),
+                                            ),
+                                            if (m.kind != 'text')
+                                              Text(
+                                                m.kind,
+                                                style: Theme.of(
+                                                  context,
+                                                ).textTheme.labelSmall,
+                                              ),
+                                          ],
+                                        ),
+                                      ),
+                                      if (m.text.isNotEmpty)
+                                        IconButton(
+                                          tooltip: '复制消息',
+                                          onPressed: () => copyMessage(m.text),
+                                          icon: const Icon(
+                                            Icons.copy_outlined,
+                                            size: 18,
+                                          ),
+                                        ),
+                                      if (m.kind != 'file' &&
+                                          findResourceId(
+                                            m.extra['raw'],
+                                          ).isNotEmpty)
+                                        IconButton(
+                                          tooltip: '下载附件',
+                                          icon: const Icon(
+                                            Icons.download_outlined,
+                                            size: 18,
+                                          ),
+                                          onPressed: () => download(m),
+                                        ),
+                                      IconButton(
+                                        tooltip: '引用回复',
+                                        onPressed: () =>
+                                            setState(() => reply = m),
+                                        icon: const Icon(Icons.reply, size: 18),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              ),
+                              ...w.outbox
+                                  .where(
+                                    (o) =>
+                                        o['accountId'] == c.accountId &&
+                                        o['conversationId'] == c.id &&
+                                        !w.messages.any(
+                                          (m) =>
+                                              m.id ==
+                                              object(o['result'])['messageId'],
+                                        ),
+                                  )
+                                  .take(10)
+                                  .map(
+                                    (o) => ListTile(
+                                      dense: true,
+                                      leading: Icon(
+                                        o['state'] == 'confirmed'
+                                            ? Icons.check_circle_outline
+                                            : o['state'] == 'sending'
+                                            ? Icons.schedule
+                                            : Icons.error_outline,
+                                        size: 18,
+                                      ),
+                                      title: Text('${o['text']}'),
+                                      trailing: IconButton(
+                                        tooltip: '复制消息',
+                                        onPressed: () =>
+                                            copyMessage('${o['text']}'),
+                                        icon: const Icon(
+                                          Icons.copy_outlined,
+                                          size: 18,
+                                        ),
+                                      ),
+                                      subtitle: Text(
+                                        {
+                                              'sending': '发送中',
+                                              'confirmed': '已确认发送',
+                                              'failed': '发送失败',
+                                              'unknown': '结果未知，请刷新核对后再发送',
+                                            }[o['state']] ??
+                                            '${o['state']}',
+                                      ),
+                                    ),
+                                  ),
+                            ].reversed.toList(),
+                          ),
+                        ),
                       ),
                     ),
                     const Divider(),
@@ -512,33 +621,43 @@ class _MessagesPageState extends ConsumerState<MessagesPage> {
     );
   }
 
+  Future<void> copyMessage(String text) => guarded(context, () async {
+    await Clipboard.setData(ClipboardData(text: text));
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('消息已复制'), duration: Duration(seconds: 1)),
+      );
+    }
+  });
+
   Future<void> send() async {
     final w = ref.read(workspaceProvider), c = w.selectedConversation;
     if (c == null || (compose.text.trim().isEmpty && attachment == null)) {
       return;
     }
-    setState(() => sending = true);
+    final text = compose.text;
+    final previousReply = reply;
+    final previousAttachment = attachment;
+    setState(() {
+      sending = true;
+      compose.clear();
+      reply = null;
+      attachment = null;
+    });
     await guarded(context, () async {
       await w.send(
         c,
-        compose.text,
-        reply: reply,
-        attachment: attachment,
+        text,
+        reply: previousReply,
+        attachment: previousAttachment,
         image:
-            attachment != null &&
+            previousAttachment != null &&
             RegExp(
               r'\.(png|jpe?g|gif|webp)$',
               caseSensitive: false,
-            ).hasMatch(attachment!),
+            ).hasMatch(previousAttachment),
         markdown: markdown,
       );
-      compose.clear();
-      if (mounted) {
-        setState(() {
-          reply = null;
-          attachment = null;
-        });
-      }
     });
     if (mounted) setState(() => sending = false);
   }
@@ -550,7 +669,10 @@ class _MessagesPageState extends ConsumerState<MessagesPage> {
           .downloadAttachment(message, findResourceId(message.extra['raw']));
       await FilePicker.saveFile(
         bytes: await File(path).readAsBytes(),
-        fileName: message.kind == 'image' ? 'image.png' : 'attachment',
+        fileName: p.basename(
+          '${attachmentDetails(message.extra['raw'])['name'] ?? (message.kind == 'image' ? 'image.png' : 'attachment')}'
+              .replaceAll('\\', '/'),
+        ),
       );
     });
   }

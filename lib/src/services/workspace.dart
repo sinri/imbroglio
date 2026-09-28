@@ -7,11 +7,14 @@ import 'package:flutter/services.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import '../core/models.dart';
+import '../core/normalize.dart';
 import '../core/rpc.dart';
 import 'plugins.dart';
 import 'store.dart';
+import 'activity.dart';
 
 class Workspace extends ChangeNotifier {
+  late final activities = ActivityLog(changed);
   late Store store;
   late PluginManager plugins;
   late String root;
@@ -27,6 +30,9 @@ class Workspace extends ChangeNotifier {
   List<AccountRef> accounts = [];
   List<Conversation> conversations = [];
   List<Message> messages = [];
+  int messageLimit = 100;
+  bool loadingEarlier = false;
+  final _attachments = <String, Future<String>>{};
   List<Json> outbox = [];
   List<Json> packages = [];
   final clients = <String, RpcClient>{};
@@ -38,9 +44,24 @@ class Workspace extends ChangeNotifier {
   final _backoff = <String, DateTime>{};
   final _next = <String, DateTime>{};
   final _streams = <String>{};
+  final _historyDone = <String>{};
+  final senderProfiles = <String, Json>{};
+  final _resolvingSenders = <String>{};
+  final _senderQueue = <String, Map<String, Message>>{};
+  final _sendingAccounts = <String, int>{};
+  final _readAt = <String, int>{};
+  final _seenPlatformTime = <String, int>{};
+  final int startedAt = DateTime.now().millisecondsSinceEpoch;
+  bool chatVisible = true;
+  bool windowFocused = true;
+  int get historyCutoff =>
+      DateTime.now().subtract(const Duration(days: 90)).millisecondsSinceEpoch;
+  bool isReading(Conversation c) =>
+      chatVisible && windowFocused && selectedConversation?.key == c.key;
   Timer? _timer;
   RandomAccessFile? _instanceLock;
   void Function(Message message)? onIncoming;
+  VoidCallback? requestMessagesPage;
   AccountRef account(String id) => accounts.firstWhere((a) => a.id == id);
   void changed() {
     if (!closing) notifyListeners();
@@ -75,6 +96,13 @@ class Workspace extends ChangeNotifier {
       conversations = (await store.list(
         'conversations',
       )).map(Conversation.fromJson).toList();
+      for (final c in conversations) {
+        final read = await store.get('readState', c.key);
+        _readAt[c.key] = read?['timestamp'] as int? ?? 0;
+        _seenPlatformTime[c.key] = read?['platformTime'] as int? ?? -1;
+        final cursor = await store.get('cursors', c.key);
+        if (cursor?['historyDone'] == true) _historyDone.add(c.key);
+      }
       startupProgress('正在载入插件与偏好设置…');
       final seeded = await store.get('settings', 'seeded');
       for (final file
@@ -135,7 +163,14 @@ class Workspace extends ChangeNotifier {
     }
   }
 
-  Future<RpcClient> _start(AccountRef a) async {
+  Future<RpcClient> _start(AccountRef a) => activities.run(
+    'connect:${a.id}',
+    '连接消息服务',
+    a.label,
+    (_) => _startClient(a),
+  );
+
+  Future<RpcClient> _startClient(AccountRef a) async {
     String entry = adapterPath;
     String binary = '';
     if (repositories.containsKey(a.platform)) {
@@ -197,11 +232,16 @@ class Workspace extends ChangeNotifier {
           if (m.accountId != a.id) {
             throw const AppFailure('identity', '插件消息账号不匹配');
           }
-          final exists = await store.get('messages', m.key) != null;
-          await store.saveMessage(m);
-          if (!exists) {
+          final isNew = await store.saveIncoming(m);
+          if (isNew) {
             await _incrementUnread(m);
-            onIncoming?.call(m);
+            if (!_isOwn(m) &&
+                m.timestamp >= startedAt &&
+                m.timestamp >
+                    (_readAt[compositeKey(m.accountId, m.conversationId)] ??
+                        0)) {
+              onIncoming?.call(m);
+            }
           }
           if (selectedConversation?.key ==
               compositeKey(a.id, m.conversationId)) {
@@ -222,6 +262,7 @@ class Workspace extends ChangeNotifier {
         state.gap = true;
         state.error = '${params['reason']}';
         state.mode = '补拉中';
+        _next.remove(key);
         changed();
     }
   }
@@ -299,11 +340,22 @@ class Workspace extends ChangeNotifier {
     changed();
   }
 
-  Future<void> refreshConversations(AccountRef a, {bool more = false}) async {
+  Future<void> refreshConversations(AccountRef a, {bool more = false}) =>
+      activities.run(
+        'conversations:${a.id}:$more',
+        more ? '发现更多会话' : '刷新会话列表',
+        a.label,
+        (task) => _refreshConversations(a, more: more, activity: task),
+      );
+
+  Future<void> _refreshConversations(
+    AccountRef a, {
+    required bool more,
+    required BackgroundActivity activity,
+  }) async {
     final rpc = await client(a);
-    final page = more
-        ? await store.get('cursors', 'conversations:${a.id}')
-        : null;
+    final page = more ? await store.get('discovery', a.id) : null;
+    if (more && page?['done'] == true) return;
     final result = object(
       await rpc.call('conversations', {
         if (page?['cursor'] != null && page!['cursor'] != '')
@@ -311,41 +363,91 @@ class Workspace extends ChangeNotifier {
       }),
     );
     for (final j in (result['items'] as List? ?? [])) {
-      var c = Conversation.fromJson(object(j));
-      if (c.accountId != a.id) throw const AppFailure('identity', '会话账号不匹配');
-      final old = conversations.where((x) => x.key == c.key).firstOrNull;
-      c = c.copyWith(
-        watched: old?.watched ?? false,
-        unread: old?.unread ?? c.unread,
-      );
-      conversations.removeWhere((x) => x.key == c.key);
-      conversations.add(c);
-      await store.put(
-        'conversations',
-        c.key,
-        c.toJson(),
-        account: a.id,
-        ts: c.updatedAt,
-      );
+      await store.db.transaction(() async {
+        var c = Conversation.fromJson(object(j));
+        if (c.accountId != a.id) throw const AppFailure('identity', '会话账号不匹配');
+        final old = conversations.where((x) => x.key == c.key).firstOrNull;
+        c = c.copyWith(
+          watched: old?.watched ?? false,
+          unread: c.unreadIsLocal
+              ? (old?.unread ?? 0)
+              : ((_seenPlatformTime[c.key] ?? -1) >= c.updatedAt
+                    ? (old?.unread ?? 0)
+                    : c.unread),
+          updatedAt: old != null && old.updatedAt > c.updatedAt
+              ? old.updatedAt
+              : c.updatedAt,
+        );
+        _upsertConversation(c);
+        await store.put(
+          'conversations',
+          c.key,
+          c.toJson(),
+          account: a.id,
+          ts: c.updatedAt,
+        );
+      });
     }
     await store.put('cursors', 'conversations:${a.id}', {
       'cursor': result['cursor'],
     });
+    final discovery = await store.get('discovery', a.id);
+    if (more || discovery == null || discovery['done'] == true) {
+      final next = '${result['cursor'] ?? ''}';
+      await store.put('discovery', a.id, {
+        'cursor': next,
+        'done': next.isEmpty || next == page?['cursor'],
+        'checkedAt': DateTime.now().millisecondsSinceEpoch,
+      });
+    }
     conversations.sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
+    activity.progress('已更新 ${(result['items'] as List? ?? []).length} 个会话');
     changed();
   }
 
   Future<void> selectConversation(Conversation c) async {
+    if (selectedConversation?.key != c.key) {
+      messageLimit = 100;
+      messages = [];
+    }
     selectedAccount = c.accountId;
     selectedConversation = c.copyWith(unread: 0);
-    await _saveConversation(selectedConversation!);
+    await markRead(selectedConversation!);
     await loadMessages();
     await syncConversation(c);
   }
 
+  bool _isOwn(Message m) =>
+      m.extra['isOwn'] == true ||
+      (account(m.accountId).userId.isNotEmpty &&
+          account(m.accountId).userId == m.senderId);
+
+  Future<void> markRead(Conversation c) => store.db.transaction(() async {
+    final latest = conversations.where((v) => v.key == c.key).firstOrNull ?? c;
+    final now = DateTime.now().millisecondsSinceEpoch;
+    if (now > (_readAt[c.key] ?? 0)) _readAt[c.key] = now;
+    _seenPlatformTime[c.key] = latest.updatedAt;
+    await store.put('readState', c.key, {
+      'timestamp': _readAt[c.key],
+      'platformTime': latest.updatedAt,
+    });
+    await _saveConversation(latest.copyWith(unread: 0));
+  });
+
+  Future<void> updateReading({bool? visible, bool? focused}) async {
+    if (closing) return;
+    chatVisible = visible ?? chatVisible;
+    windowFocused = focused ?? windowFocused;
+    final c = selectedConversation;
+    if (c != null && isReading(c)) {
+      await markRead(
+        conversations.where((v) => v.key == c.key).firstOrNull ?? c,
+      );
+    }
+  }
+
   Future<void> _saveConversation(Conversation c) async {
-    conversations.removeWhere((x) => x.key == c.key);
-    conversations.add(c);
+    _upsertConversation(c);
     await store.put(
       'conversations',
       c.key,
@@ -356,10 +458,35 @@ class Workspace extends ChangeNotifier {
     changed();
   }
 
+  void _upsertConversation(Conversation c) {
+    final index = conversations.indexWhere((x) => x.key == c.key);
+    if (index < 0) {
+      conversations.add(c);
+    } else {
+      conversations[index] = c;
+    }
+  }
+
   Future<void> watch(Conversation c, bool value) async {
     await _saveConversation(c.copyWith(watched: value));
     if (!value && _streams.remove(c.key)) {
       await clients[c.accountId]?.call('unsubscribe', {'conversationId': c.id});
+    }
+  }
+
+  Future<void> showEarlierMessages() async {
+    final c = selectedConversation;
+    if (c == null || loadingEarlier) return;
+    loadingEarlier = true;
+    try {
+      messageLimit += 100;
+      await loadMessages();
+      if (messages.length < messageLimit && !_historyDone.contains(c.key)) {
+        await syncConversation(c, older: true);
+      }
+    } finally {
+      loadingEarlier = false;
+      changed();
     }
   }
 
@@ -371,50 +498,204 @@ class Workspace extends ChangeNotifier {
             'messages',
             account: c.accountId,
             conversation: c.id,
-            limit: 500,
+            limit: messageLimit,
           )).map(Message.fromJson).toList()
           ..sort((a, b) => a.timestamp.compareTo(b.timestamp));
     if (selectedConversation?.key == c.key) {
       messages = data;
+      unawaited(resolveSenders(c.accountId, data));
       outbox = await store.list('outbox');
       changed();
     }
   }
 
-  Future<void> _incrementUnread(Message m) async {
+  bool validSenderAvatarPath(String accountId, String path) =>
+      path.isNotEmpty &&
+      p.isWithin(
+        p.join(root, 'accounts', accountId, 'downloads'),
+        p.normalize(path),
+      ) &&
+      File(path).existsSync();
+
+  Future<void> resolveSenders(String accountId, List<Message> list) async {
+    if (closing) return;
+    final queue = _senderQueue.putIfAbsent(accountId, () => {});
+    for (final m in list) {
+      final id = senderLookupId(m);
+      if (id.isNotEmpty &&
+          (messageSenderName(m).isEmpty || messageSenderAvatar(m).isEmpty)) {
+        queue[compositeKey(m.conversationId, id)] = m;
+      }
+    }
+    if (!_resolvingSenders.add(accountId)) return;
+    _busy.add('senders:$accountId');
+    bool fresh(Json? profile) =>
+        (profile?['avatarPath'] == null ||
+            validSenderAvatarPath(accountId, '${profile?['avatarPath']}')) &&
+        profile?['version'] == 2 &&
+        (profile?['expires'] as int? ?? 0) >
+            DateTime.now().millisecondsSinceEpoch;
+    BackgroundActivity? currentActivity;
+    try {
+      while (queue.isNotEmpty && !closing) {
+        final conversationId = queue.values.first.conversationId;
+        final entries = queue.entries
+            .where((e) => e.value.conversationId == conversationId)
+            .take(20)
+            .toList();
+        final missing = <String, Message>{};
+        for (final entry in entries) {
+          queue.remove(entry.key);
+          final m = entry.value, id = senderLookupId(entry.value);
+          final key = compositeKey(accountId, id);
+          if (fresh(senderProfiles[key])) continue;
+          final saved = await store.get('senders', key);
+          if (fresh(saved)) {
+            senderProfiles[key] = saved!;
+          } else {
+            missing[id] = m;
+          }
+        }
+        if (missing.isEmpty || closing) continue;
+        if (!account(accountId).enabled && !clients.containsKey(accountId)) {
+          continue;
+        }
+        final activity = currentActivity = activities.begin(
+          'senders:$accountId',
+          '更新联系人资料',
+          account(accountId).label,
+        );
+        activity.progress('正在查询 ${missing.length} 位联系人的名称与头像');
+        var returned = <Json>[];
+        try {
+          final c = conversations
+              .where((c) => c.accountId == accountId && c.id == conversationId)
+              .firstOrNull;
+          final response = object(
+            await (await client(account(accountId))).call('contacts.resolve', {
+              'ids': missing.keys.toList(),
+              if (c != null) 'conversation': c.toJson(),
+              'openIds': {
+                for (final entry in missing.entries)
+                  if (field(object(entry.value.extra['raw']), [
+                    'senderOpenDingTalkId',
+                  ]).isNotEmpty)
+                    entry.key: field(object(entry.value.extra['raw']), [
+                      'senderOpenDingTalkId',
+                    ]),
+              },
+            }),
+          );
+          returned = (response['items'] as List? ?? []).map(object).toList();
+        } catch (e) {
+          notice = '联系人资料暂不可用，将自动重试：$e';
+          activity.finish(
+            state: 'failed',
+            detail: '$e',
+            retryAt: DateTime.now().add(const Duration(seconds: 30)),
+          );
+        }
+        for (final id in missing.keys) {
+          final key = compositeKey(accountId, id);
+          final profile =
+              returned.where((r) => r['id'] == id).firstOrNull ??
+              <String, dynamic>{};
+          final previous = senderProfiles[key];
+          final name = field(profile, [
+            'name',
+          ], field(previous ?? {}, ['name'], messageSenderName(missing[id]!)));
+          final avatar = avatarUrl(profile['avatar']).isNotEmpty
+              ? avatarUrl(profile['avatar'])
+              : avatarUrl(previous?['avatar']);
+          var avatarPath = '${previous?['avatarPath'] ?? ''}';
+          final resource = '${profile['avatarResourceId'] ?? ''}';
+          if (resource.isNotEmpty) {
+            try {
+              avatarPath = await cachedAttachment(missing[id]!, resource);
+            } catch (e) {
+              notice = '联系人头像暂不可用，将自动重试：$e';
+            }
+          }
+          final hasFile = validSenderAvatarPath(accountId, avatarPath);
+          final saved = <String, dynamic>{
+            if (hasFile) 'avatarPath': avatarPath,
+            'version': 2,
+            'id': id,
+            'name': name,
+            'avatar': avatar,
+            'expires': DateTime.now()
+                .add(
+                  name.isNotEmpty && (avatar.isNotEmpty || hasFile)
+                      ? const Duration(hours: 12)
+                      : const Duration(seconds: 30),
+                )
+                .millisecondsSinceEpoch,
+          };
+          senderProfiles[key] = saved;
+          await store.put('senders', key, saved, account: accountId);
+        }
+        activity.finish(detail: '已处理 ${missing.length} 位联系人');
+        changed();
+      }
+      changed();
+    } catch (e) {
+      currentActivity?.finish(state: 'failed', detail: '$e');
+      notice = '联系人资料更新失败：$e';
+      changed();
+    } finally {
+      _resolvingSenders.remove(accountId);
+      _busy.remove('senders:$accountId');
+    }
+  }
+
+  Future<void> _incrementUnread(Message m) => store.db.transaction(() async {
     final c = conversations
         .where((c) => c.accountId == m.accountId && c.id == m.conversationId)
         .firstOrNull;
     if (c != null) {
+      if (isReading(c)) {
+        // Persist the last visible message too, including delayed delivery.
+        final previous = _readAt[c.key] ?? 0;
+        if (m.timestamp > previous) _readAt[c.key] = m.timestamp;
+        await store.put('readState', c.key, {
+          'timestamp': _readAt[c.key] ?? 0,
+          'platformTime': _seenPlatformTime[c.key] ?? -1,
+        });
+      }
       await _saveConversation(
         c.copyWith(
-          unread: selectedConversation?.key == c.key ? 0 : c.unread + 1,
-          updatedAt: m.timestamp,
+          unread: isReading(c)
+              ? 0
+              : (_isOwn(m) ||
+                        m.timestamp <= (_readAt[c.key] ?? 0) ||
+                        !c.unreadIsLocal
+                    ? c.unread
+                    : c.unread + 1),
+          updatedAt: m.timestamp > c.updatedAt ? m.timestamp : c.updatedAt,
         ),
       );
     }
-  }
+  });
 
   Future<void> syncConversation(Conversation c, {bool older = false}) async {
     if (!_busy.add(c.key)) return;
     final state = sync[c.key] ??= SyncState();
+    BackgroundActivity? activity;
+    var received = 0, fetchedPages = 0;
     try {
       final a = account(c.accountId);
       if (!a.enabled) return;
+      activity = activities.begin(
+        'sync:${c.key}:$older',
+        older ? '补齐历史消息' : '拉取新消息',
+        '${a.label} · ${c.title}',
+      );
+      activity.progress('正在请求消息');
       final rpc = await client(a);
       final saved = await store.get('cursors', c.key);
-      final current = await store.list(
-        'messages',
-        account: a.id,
-        conversation: c.id,
-        limit: 10000,
-      );
+      final requestStartedAt = DateTime.now().millisecondsSinceEpoch;
       int? before;
-      if (older && current.isNotEmpty) {
-        before = current
-            .map((e) => e['timestamp'] as int)
-            .reduce((a, b) => a < b ? a : b);
-      }
+      if (older) before = await store.oldestMessage(a.id, c.id);
       var since = older
           ? null
           : (saved?['resumeSince'] ?? saved?['timestamp']) as int?;
@@ -422,7 +703,9 @@ class Workspace extends ChangeNotifier {
           ? (saved?['historyCursor'] as String?)
           : (saved?['resumeCursor'] as String?);
       if (older && cursor != null) before = saved?['historyBefore'] as int?;
-      var pages = 0, hasMore = false, maxTime = since ?? 0;
+      var pages = 0, hasMore = false, stalledIncrement = false;
+      var maxTime = (saved?['resumeMaxTime'] as int?) ?? since ?? 0;
+      int? pageOldest;
       do {
         final result = object(
           await rpc.call('messages', {
@@ -439,14 +722,27 @@ class Workspace extends ChangeNotifier {
           if (m.accountId != a.id || m.conversationId != c.id) {
             throw const AppFailure('identity', '消息来源不匹配');
           }
-          final existed = await store.get('messages', m.key) != null;
-          await store.saveMessage(m);
-          if (!older && saved != null && !existed) {
+          if (pageOldest == null || m.timestamp < pageOldest) {
+            pageOldest = m.timestamp;
+          }
+          if (older && m.timestamp < historyCutoff) continue;
+          final existed = !await store.saveIncoming(m);
+          if (!existed && m.timestamp >= historyCutoff) {
             await _incrementUnread(m);
-            onIncoming?.call(m);
+            if (!older &&
+                !_isOwn(m) &&
+                m.timestamp >= startedAt &&
+                m.timestamp >
+                    (_readAt[compositeKey(m.accountId, m.conversationId)] ??
+                        0)) {
+              onIncoming?.call(m);
+            }
           }
           if (m.timestamp > maxTime) maxTime = m.timestamp;
         }
+        received += items.length;
+        fetchedPages++;
+        activity.progress('已拉取 $fetchedPages 页 · $received 条消息');
         final next = '${result['cursor'] ?? ''}';
         hasMore = result['hasMore'] == true;
         if (next.isEmpty || next == cursor) {
@@ -458,33 +754,66 @@ class Workspace extends ChangeNotifier {
               a.platform == 'dingtalk') {
             since = maxTime;
           } else {
+            stalledIncrement = !older && since != null && hasMore;
             break;
           }
         } else {
           cursor = next;
         }
-      } while (!older && since != null && ++pages < 10);
-      state.gap = since != null && hasMore;
+      } while (!older &&
+          since != null &&
+          ++pages < 2 &&
+          (_sendingAccounts[a.id] ?? 0) == 0);
+      if (!older) state.gap = since != null && hasMore;
       final checkpoint = <String, dynamic>{...?saved};
       if (older) {
         checkpoint['historyCursor'] = cursor;
         checkpoint['historyBefore'] = before;
-      } else if (maxTime > 0) {
+        final reachedEnd =
+            !hasMore || (pageOldest != null && pageOldest <= historyCutoff);
+        final stalled =
+            hasMore &&
+            cursor == null &&
+            (pageOldest == null || (before != null && pageOldest >= before));
+        if (reachedEnd || stalled) {
+          _historyDone.add(c.key);
+          checkpoint['historyDone'] = true;
+          checkpoint['historyIncomplete'] = stalled;
+        }
+      } else {
+        if (saved?['timestamp'] == null && saved?['resumeSince'] == null) {
+          if (!hasMore) {
+            _historyDone.add(c.key);
+            checkpoint['historyDone'] = true;
+          } else if (cursor != null) {
+            checkpoint['historyCursor'] = cursor;
+          }
+        }
         if (!state.gap) {
-          checkpoint['timestamp'] = maxTime;
+          checkpoint['timestamp'] = maxTime > 0 ? maxTime : requestStartedAt;
           checkpoint.remove('resumeCursor');
           checkpoint.remove('resumeSince');
+          checkpoint.remove('resumeMaxTime');
         } else {
+          checkpoint['resumeMaxTime'] = maxTime;
           checkpoint['resumeSince'] = since;
           checkpoint['resumeCursor'] = cursor;
         }
       }
       await store.put('cursors', c.key, checkpoint);
-      state.error = state.gap ? '可能仍有未补齐消息；请加载历史记录' : '';
+      state.error = stalledIncrement
+          ? '增量分页无法继续，稍后重试；消息可能不完整'
+          : state.gap
+          ? '消息有缺口，正在自动补齐'
+          : checkpoint['historyIncomplete'] == true
+          ? '历史分页边界无法继续，部分历史可能不完整'
+          : '';
       state.lastSuccess = DateTime.now().millisecondsSinceEpoch;
       state.failures = 0;
       _backoff.remove(c.key);
-      if (a.platform == 'dingtalk' && c.watched && !_streams.contains(c.key)) {
+      if (a.platform == 'dingtalk' &&
+          (c.watched || c.key == selectedConversation?.key) &&
+          !_streams.contains(c.key)) {
         _streams.add(c.key);
         try {
           await rpc.call('subscribe', {'conversation': c.toJson()});
@@ -493,8 +822,20 @@ class Workspace extends ChangeNotifier {
           state.error = '$e';
         }
       }
-      if (selectedConversation?.key == c.key) await loadMessages();
+      if (selectedConversation?.key == c.key && !closing) await loadMessages();
+      if (!older && state.gap) {
+        _next[c.key] = DateTime.now().add(
+          Duration(seconds: stalledIncrement ? 30 : 0),
+        );
+      }
       await store.put('sync', c.key, state.toJson());
+      activity.finish(
+        state: state.error.isNotEmpty ? 'waiting' : 'completed',
+        detail: state.error.isNotEmpty
+            ? '${state.error}（本次 $received 条）'
+            : '已拉取 $fetchedPages 页 · $received 条消息',
+        retryAt: state.gap ? _next[c.key] : null,
+      );
     } catch (e) {
       state.failures++;
       state.error = '$e';
@@ -505,21 +846,41 @@ class Workspace extends ChangeNotifier {
           ? e.retryAfter!
           : (5 * (1 << state.failures.clamp(0, 6)));
       _backoff[c.key] = DateTime.now().add(Duration(seconds: delay));
+      activity?.finish(state: 'failed', detail: '$e', retryAt: _backoff[c.key]);
     } finally {
       _busy.remove(c.key);
       changed();
     }
   }
 
-  void tick() {
+  int get backgroundPending => conversations
+      .where(
+        (c) =>
+            account(c.accountId).enabled &&
+            !_historyDone.contains(c.key) &&
+            (c.updatedAt == 0 ||
+                c.updatedAt >= historyCutoff ||
+                c.watched ||
+                c.unread > 0),
+      )
+      .length;
+
+  void tick({DateTime? at}) {
     if (closing) return;
-    final now = DateTime.now();
-    for (final a in accounts.where(
-      (a) => a.enabled && !_updating.contains(a.platform),
-    )) {
+    final now = at ?? DateTime.now();
+    bool due(String key) =>
+        !(_next[key]?.isAfter(now) ?? false) &&
+        !(_backoff[key]?.isAfter(now) ?? false) &&
+        !_busy.contains(key);
+    bool available(String id) =>
+        account(id).enabled &&
+        !_updating.contains(account(id).platform) &&
+        (_sendingAccounts[id] ?? 0) == 0;
+    for (final a in accounts.where((a) => available(a.id))) {
       final key = 'account:${a.id}';
-      if (!(_next[key]?.isAfter(now) ?? false) && _busy.add(key)) {
-        _next[key] = now.add(const Duration(seconds: 60));
+      if (due(key) && _busy.length < 4) {
+        _busy.add(key);
+        _next[key] = now.add(const Duration(seconds: 30));
         refreshConversations(a)
             .catchError((Object e) {
               notice = '${a.label}：$e';
@@ -527,28 +888,105 @@ class Workspace extends ChangeNotifier {
             })
             .whenComplete(() => _busy.remove(key));
       }
+      // Discover remaining pages incrementally without delaying live requests.
+      final moreKey = 'discover:${a.id}';
+      if (due(moreKey) && !_busy.contains(key) && _busy.length < 3) {
+        _busy.add(moreKey);
+        _next[moreKey] = now.add(const Duration(seconds: 10));
+        (() async {
+              final cursor = await store.get('discovery', a.id);
+              if (cursor?['done'] == true) return;
+              await refreshConversations(a, more: true);
+            })()
+            .catchError((Object e) {
+              notice = '${a.label} 会话发现稍后重试：$e';
+              changed();
+            })
+            .whenComplete(() => _busy.remove(moreKey));
+      }
     }
-    for (final c in conversations.where(
-      (c) => c.watched || c.key == selectedConversation?.key,
-    )) {
-      if (!account(c.accountId).enabled ||
-          _updating.contains(account(c.accountId).platform)) {
-        continue;
-      }
-      if ((_backoff[c.key]?.isAfter(now) ?? false) ||
-          (_next[c.key]?.isAfter(now) ?? false)) {
-        continue;
-      }
+    final candidates = conversations
+        .where(
+          (c) =>
+              available(c.accountId) &&
+              (c.updatedAt == 0 ||
+                  c.updatedAt >= historyCutoff ||
+                  c.watched ||
+                  c.unread > 0 ||
+                  c.key == selectedConversation?.key),
+        )
+        .toList();
+    candidates.sort((a, b) {
+      final dueOrder = (_next[a.key] ?? DateTime(1970)).compareTo(
+        _next[b.key] ?? DateTime(1970),
+      );
+      if (dueOrder != 0) return dueOrder;
+      return b.unread.compareTo(a.unread);
+    });
+    for (final c in candidates) {
+      if (_busy.length >= 3) break;
+      if (!due(c.key)) continue;
       _next[c.key] = now.add(
         Duration(seconds: c.key == selectedConversation?.key ? 5 : 30),
       );
       unawaited(syncConversation(c));
+    }
+    // At most one history page at a time; give pending sends and live data priority.
+    if (!_busy.contains('history') && _busy.length < 4) {
+      final history =
+          candidates
+              .where(
+                (c) =>
+                    (sync[c.key]?.lastSuccess ?? 0) > 0 &&
+                    !_historyDone.contains(c.key) &&
+                    !_busy.contains(c.key) &&
+                    due('history:${c.key}') &&
+                    !(_backoff[c.key]?.isAfter(now) ?? false),
+              )
+              .toList()
+            ..sort(
+              (a, b) => (_next['history:${a.key}'] ?? DateTime(1970)).compareTo(
+                _next['history:${b.key}'] ?? DateTime(1970),
+              ),
+            );
+      if (history.isNotEmpty) {
+        final c = history.first;
+        _next['history:${c.key}'] = now.add(const Duration(seconds: 10));
+        _busy.add('history');
+        syncConversation(
+          c,
+          older: true,
+        ).whenComplete(() => _busy.remove('history'));
+      }
     }
   }
 
   Future<void> send(
     Conversation c,
     String text, {
+    Message? reply,
+    String? attachment,
+    bool image = false,
+    bool markdown = false,
+  }) => activities.run(
+    'send:${newId()}',
+    '发送消息',
+    '${account(c.accountId).label} · ${c.title}',
+    (activity) => _send(
+      c,
+      text,
+      activity: activity,
+      reply: reply,
+      attachment: attachment,
+      image: image,
+      markdown: markdown,
+    ),
+  );
+
+  Future<void> _send(
+    Conversation c,
+    String text, {
+    required BackgroundActivity activity,
     Message? reply,
     String? attachment,
     bool image = false,
@@ -566,6 +1004,7 @@ class Workspace extends ChangeNotifier {
     await store.put('outbox', id, record, ts: record['timestamp'] as int);
     outbox = await store.list('outbox');
     changed();
+    _sendingAccounts[c.accountId] = (_sendingAccounts[c.accountId] ?? 0) + 1;
     try {
       final result = await (await client(account(c.accountId))).call('send', {
         'conversation': c.toJson(),
@@ -588,7 +1027,7 @@ class Workspace extends ChangeNotifier {
         'id': id,
         'state': 'confirmed',
       });
-      await syncConversation(c);
+      unawaited(syncConversation(c));
     } catch (e) {
       final state =
           e is AppFailure &&
@@ -601,6 +1040,10 @@ class Workspace extends ChangeNotifier {
               ].contains(e.code)
           ? 'failed'
           : 'unknown';
+      activity.finish(
+        state: state,
+        detail: state == 'unknown' ? '发送结果未知，请先核对原平台：$e' : '$e',
+      );
       await store.put('outbox', id, {
         ...record,
         'state': state,
@@ -608,6 +1051,7 @@ class Workspace extends ChangeNotifier {
       }, ts: record['timestamp'] as int);
       rethrow;
     } finally {
+      _sendingAccounts[c.accountId] = (_sendingAccounts[c.accountId] ?? 1) - 1;
       outbox = await store.list('outbox');
       changed();
     }
@@ -710,7 +1154,41 @@ class Workspace extends ChangeNotifier {
     await selectConversation(c);
   }
 
-  Future<String> downloadAttachment(Message message, String resourceId) async {
+  Future<String> cachedAttachment(Message message, String resourceId) async {
+    final key = compositeKey(message.key, resourceId);
+    final task = _attachments.putIfAbsent(key, () async {
+      final saved = await store.get('attachments', key);
+      final path = saved?['path'] as String?;
+      if (path != null &&
+          p.isWithin(
+            p.join(root, 'accounts', message.accountId, 'downloads'),
+            p.normalize(path),
+          ) &&
+          await File(path).exists()) {
+        return path;
+      }
+      final result = await downloadAttachment(message, resourceId);
+      await store.put('attachments', key, {
+        'path': result,
+      }, account: message.accountId);
+      return result;
+    });
+    try {
+      return await task;
+    } finally {
+      if (identical(_attachments[key], task)) _attachments.remove(key);
+    }
+  }
+
+  Future<String> downloadAttachment(Message message, String resourceId) =>
+      activities.run(
+        'download:${message.key}:$resourceId',
+        '下载图片或附件',
+        account(message.accountId).label,
+        (_) => _downloadAttachment(message, resourceId),
+      );
+
+  Future<String> _downloadAttachment(Message message, String resourceId) async {
     final result = object(
       await (await client(account(message.accountId))).call(
         'attachment.download',

@@ -32,6 +32,100 @@ class RecordingAdapter extends adapter.Adapter {
 }
 
 void main() {
+  test(
+    'DingTalk group sender uses open ID and maps profile back to message ID',
+    () async {
+      final a = RecordingAdapter('dingtalk');
+      a.response = {
+        'members': [
+          {
+            'openDingTalkId': 'open1',
+            'nick': '张三',
+            'avatar': 'https://example.com/avatar.png',
+          },
+        ],
+      };
+      final result = object(
+        await a.handle(1, 'contacts.resolve', {
+          'ids': ['staff1'],
+          'openIds': {'staff1': 'open1'},
+          'conversation': {'id': 'chat1', 'kind': 'group'},
+        }),
+      );
+      expect(
+        a.command,
+        containsAllInOrder([
+          'chat',
+          'group',
+          'members',
+          'list-by-ids',
+          '--id',
+          'chat1',
+          '--users',
+          'open1',
+        ]),
+      );
+      expect(result['items'], [
+        {
+          'id': 'staff1',
+          'name': '张三',
+          'avatar': 'https://example.com/avatar.png',
+        },
+      ]);
+    },
+  );
+
+  test('directory result preserves a string avatar', () async {
+    final a = RecordingAdapter('dingtalk');
+    a.response = [
+      {
+        'orgEmployeeModel': {'orgUserId': 'staff1', 'orgUserName': '李四'},
+        'avatar': 'https://example.com/avatar.png',
+      },
+    ];
+    final result = object(
+      await a.handle(1, 'contacts.resolve', {
+        'ids': ['staff1'],
+      }),
+    );
+    expect(
+      (result['items'] as List).single['avatar'],
+      'https://example.com/avatar.png',
+    );
+    expect(
+      a.command,
+      containsAllInOrder(['contact', 'user', 'get', '--ids', 'staff1']),
+    );
+  });
+
+  test('actual DingTalk member shape preserves avatar media ID', () async {
+    final a = RecordingAdapter('dingtalk');
+    a.response = {
+      'members': [
+        {
+          'openDingtalkId': 'open1',
+          'groupNick': '',
+          'nick': '张三',
+          'avatarMediaId': '@media',
+        },
+      ],
+    };
+    final result = object(
+      await a.handle(1, 'contacts.resolve', {
+        'ids': ['staff1'],
+        'openIds': {'staff1': 'open1'},
+        'conversation': {'id': 'chat1', 'kind': 'group'},
+      }),
+    );
+    expect((result['items'] as List).single, {
+      'id': 'staff1',
+      'name': '张三',
+      'avatar': '',
+      'avatarResourceId': '@media',
+    });
+    expect(a.command, contains('list-by-ids'));
+  });
+
   test('Feishu uses explicit user identity and exact profile', () async {
     final a = RecordingAdapter('feishu');
     await a.handle(1, 'conversations', {});

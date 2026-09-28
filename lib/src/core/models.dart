@@ -65,7 +65,7 @@ class AccountRef {
 class Conversation {
   final String accountId, id, title, kind, peerId;
   final int updatedAt, unread;
-  final bool watched;
+  final bool watched, unreadIsLocal;
   const Conversation({
     required this.accountId,
     required this.id,
@@ -75,6 +75,7 @@ class Conversation {
     this.updatedAt = 0,
     this.unread = 0,
     this.watched = false,
+    this.unreadIsLocal = true,
   });
   String get key => compositeKey(accountId, id);
   factory Conversation.fromJson(Json j) => Conversation(
@@ -86,6 +87,7 @@ class Conversation {
     updatedAt: j['updatedAt'] ?? 0,
     unread: j['unread'] ?? 0,
     watched: j['watched'] ?? false,
+    unreadIsLocal: j['unreadIsLocal'] ?? true,
   );
   Json toJson() => {
     'accountId': accountId,
@@ -96,18 +98,24 @@ class Conversation {
     'updatedAt': updatedAt,
     'unread': unread,
     'watched': watched,
+    'unreadIsLocal': unreadIsLocal,
   };
-  Conversation copyWith({bool? watched, int? unread, int? updatedAt}) =>
-      Conversation(
-        accountId: accountId,
-        id: id,
-        title: title,
-        kind: kind,
-        peerId: peerId,
-        watched: watched ?? this.watched,
-        unread: unread ?? this.unread,
-        updatedAt: updatedAt ?? this.updatedAt,
-      );
+  Conversation copyWith({
+    bool? watched,
+    int? unread,
+    int? updatedAt,
+    bool? unreadIsLocal,
+  }) => Conversation(
+    accountId: accountId,
+    id: id,
+    title: title,
+    kind: kind,
+    peerId: peerId,
+    watched: watched ?? this.watched,
+    unreadIsLocal: unreadIsLocal ?? this.unreadIsLocal,
+    unread: unread ?? this.unread,
+    updatedAt: updatedAt ?? this.updatedAt,
+  );
 }
 
 class Message {

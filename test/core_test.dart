@@ -6,6 +6,91 @@ import 'package:imbroglio/src/core/normalize.dart';
 import 'package:imbroglio/src/services/agent.dart';
 
 void main() {
+  test('structured post keeps title, mentions and body without raw JSON', () {
+    final message = normalizeMessage('a', 'c', {
+      'message_id': 'm',
+      'message_type': 'post',
+      'body': {
+        'content':
+            '{"zh_cn":{"title":"进度","content":[[{"tag":"text","text":"请确认"},{"tag":"at","user_name":"小明"}]]}}',
+      },
+      'sender': {
+        'id': 'u',
+        'name': 'Alice',
+        'avatar_url': 'https://example.com/a.png',
+      },
+      'parent_id': 'parent',
+    });
+    expect(message.text, '进度\n请确认@小明');
+    expect(message.extra['replyId'], 'parent');
+    expect(message.extra['avatar'], 'https://example.com/a.png');
+  });
+
+  test('DingTalk string sender, camel-case ID and createTime are retained', () {
+    final m = normalizeMessage('a', 'c', {
+      'messageId': 'm',
+      'sender': '张三',
+      'senderId': 'staff1',
+      'senderOpenDingTalkId': 'open1',
+      'createTime': 1700000000000,
+      'text': '你好',
+    });
+    expect(m.sender, '张三');
+    expect(senderLookupId(m), 'staff1');
+    expect(m.timestamp, 1700000000000);
+    final cached = Message.fromJson({
+      ...m.toJson(),
+      'sender': '',
+      'extra': {'raw': m.extra['raw']},
+    });
+    expect(messageSenderName(cached), '张三');
+    expect(senderLookupId(cached), 'staff1');
+  });
+
+  test('profile avatars accept strings and nested image sizes', () {
+    expect(
+      normalizeSenderProfile({
+        'userId': 'u',
+        'avatar': 'https://example.com/a.png',
+      })['avatar'],
+      'https://example.com/a.png',
+    );
+    expect(
+      normalizeSenderProfile({
+        'orgEmployeeModel': {
+          'orgUserId': 'u',
+          'orgUserName': '李四',
+          'avatar': 'https://example.com/b.png',
+        },
+      }),
+      {'id': 'u', 'name': '李四', 'avatar': 'https://example.com/b.png'},
+    );
+    expect(
+      avatarUrl({'avatar_72': 'https://example.com/72.png'}),
+      'https://example.com/72.png',
+    );
+    expect(avatarUrl({'avatar_72': {}}), '');
+  });
+
+  test(
+    'image markers preserve order and decode media IDs without losing plus signs',
+    () {
+      const text =
+          '前文[图片消息](mediaId=%40first%2Bvalue)中间[图片消息](mediaId=second==)后文';
+      final refs = messageImageReferences(text);
+      expect(refs.map((r) => r.resourceId), ['@first+value', 'second==']);
+      expect(text.substring(0, refs.first.start), '前文');
+      expect(text.substring(refs.first.end, refs.last.start), '中间');
+      expect(text.substring(refs.last.end), '后文');
+      expect(
+        findResourceId({'body': '{"text":"[图片消息](mediaId=%40first%2Bvalue)"}'}),
+        '@first+value',
+      );
+      expect(messageImageReferences('[图片消息](mediaId=)'), isEmpty);
+      expect(messageImageReferences('[其他链接](mediaId=test)'), isEmpty);
+    },
+  );
+
   test('approval is account-bound, parameter-bound, and single use', () {
     final gate = ApprovalGate();
     final args = {

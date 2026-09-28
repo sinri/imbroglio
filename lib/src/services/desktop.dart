@@ -8,13 +8,16 @@ class DesktopIntegration with WindowListener {
   TrayIcon? icon;
   DesktopIntegration(this.workspace);
   Future<void> initialize() async {
+    windowManager.addListener(this);
+    workspace.windowFocused = await windowManager.isFocused();
     try {
       await localNotifier.setup(
         appName: 'Imbroglio',
         shortcutPolicy: ShortcutPolicy.requireCreate,
       );
       workspace.onIncoming = (message) async {
-        if (workspace.selectedConversation?.accountId == message.accountId &&
+        if (workspace.chatVisible &&
+            workspace.selectedConversation?.accountId == message.accountId &&
             workspace.selectedConversation?.id == message.conversationId &&
             await windowManager.isFocused()) {
           return;
@@ -27,6 +30,7 @@ class DesktopIntegration with WindowListener {
         );
         notification.onClick = () async {
           await show();
+          workspace.requestMessagesPage?.call();
           final c = workspace.conversations
               .where(
                 (c) =>
@@ -78,7 +82,6 @@ class DesktopIntegration with WindowListener {
       icon!.addListener((event) {
         if (event is TrayIconClickedEvent) show();
       });
-      windowManager.addListener(this);
       await windowManager.setPreventClose(true);
     } catch (_) {
       workspace.notice = '托盘不可用，关闭窗口将退出应用';
@@ -88,6 +91,16 @@ class DesktopIntegration with WindowListener {
   Future<void> show() async {
     await windowManager.show();
     await windowManager.focus();
+  }
+
+  @override
+  void onWindowFocus() {
+    workspace.updateReading(focused: true);
+  }
+
+  @override
+  void onWindowBlur() {
+    workspace.updateReading(focused: false);
   }
 
   @override

@@ -23,6 +23,7 @@
 | messages | conversation、可选 before/since（毫秒）/cursor | items: Message[]、cursor、hasMore |
 | send | conversation、text、reply、attachment、image、markdown、idempotencyKey、approved | result、messageId |
 | contacts / conversation.open | query / contact | items / Conversation |
+| contacts.resolve | ids（最多 20 个平台用户 ID）、可选 conversation、openIds（查询 ID → 钉钉 openDingTalkId） | items: {id, name, avatar, avatarResourceId?}[]；头像资源由宿主通过 attachment.download 下载到账号缓存，缺权限时降级为消息自带身份 |
 | messages.search | query | items、coverage |
 | resources.search / resources.read | query / id | items: ResourceRef[] / text |
 | attachment.download | message、resourceId | path（必须位于账号 downloads 子目录） |

@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:drift/drift.dart';
 import 'package:drift/native.dart';
 import '../core/models.dart';
+import '../core/normalize.dart';
 
 class LocalDatabase extends GeneratedDatabase {
   LocalDatabase(super.e);
@@ -34,6 +35,35 @@ class Store {
     await db.customStatement(
       "CREATE VIRTUAL TABLE IF NOT EXISTS search_index USING fts5(bucket UNINDEXED, key UNINDEXED, account UNINDEXED, text, tokenize='trigram')",
     );
+    // Repair old rows before LIMIT/ORDER BY uses their timestamp index.
+    // Page by key so genuinely missing timestamps do not loop forever.
+    String? after;
+    while (true) {
+      final rows = await db
+          .customSelect(
+            "SELECT key,body FROM records WHERE bucket='messages' AND ts<=0${after == null ? '' : ' AND key>?'} ORDER BY key LIMIT 200",
+            variables: [if (after != null) Variable(after)],
+          )
+          .get();
+      if (rows.isEmpty) break;
+      await db.transaction(() async {
+        for (final row in rows) {
+          final body = object(jsonDecode(row.read<String>('body')));
+          final stored = body['timestamp'] as int? ?? 0;
+          final recovered = stored > 0
+              ? stored
+              : messageTimestamp(object(object(body['extra'])['raw']));
+          if (recovered > 0) {
+            body['timestamp'] = recovered;
+            await db.customStatement(
+              "UPDATE records SET ts=?,body=? WHERE bucket='messages' AND key=?",
+              [recovered, jsonEncode(body), row.read<String>('key')],
+            );
+          }
+        }
+      });
+      after = rows.last.read<String>('key');
+    }
     // A crash while sending cannot safely become an automatic retry.
     final pending = await list('outbox');
     for (final row in pending.where((e) => e['state'] == 'sending')) {
@@ -122,6 +152,23 @@ class Store {
     ts: m.timestamp,
     text: m.text,
   );
+
+  Future<bool> saveIncoming(Message m) => db.transaction(() async {
+    final isNew = await get('messages', m.key) == null;
+    await saveMessage(m);
+    return isNew;
+  });
+
+  Future<int?> oldestMessage(String account, String conversation) async {
+    final row = await db
+        .customSelect(
+          "SELECT MIN(ts) AS oldest FROM records WHERE bucket='messages' AND account=? AND conversation=?",
+          variables: [Variable(account), Variable(conversation)],
+        )
+        .getSingle();
+    return row.readNullable<int>('oldest');
+  }
+
   Future<List<ResourceRef>> search(String query, Set<String> accounts) async {
     if (query.trim().isEmpty || accounts.isEmpty) return [];
     final placeholders = accounts.map((_) => '?').join(',');
