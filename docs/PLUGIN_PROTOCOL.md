@@ -21,6 +21,8 @@
 | auth.status / auth.logout | 无 | 状态 / 空对象 |
 | conversations.active（内置 IM） | start/end（Unix 毫秒）、可选 cursor；分页保持相同时间窗口 | items: Conversation[]（活跃摘要）、cursor、complete（布尔，仅分页耗尽为 true） |
 | conversations | 可选 cursor | items: Conversation[]、cursor |
+| identity.self（钉钉） | 无 | userId、ids：经当前用户资料及精确 userId 匹配确认的消息身份别名 |
+| notifications.settings | ids（最多 10 个会话 ID） | items: {id, muted: bool}[]；缺项表示未知，钉钉返回完整账号快照供缓存 |
 | messages | conversation、可选 before/since/notBefore（毫秒）/cursor；notBefore 是自动初始化历史的下限，不改变倒序分页方向 | items: Message[]、cursor、hasMore |
 | send | conversation、text、reply、attachment、image、markdown、idempotencyKey、approved | result、messageId |
 | contacts / conversation.open | query / contact | items / Conversation |
@@ -29,7 +31,7 @@
 | resources.search / resources.read | query / id | items: ResourceRef[] / text |
 | attachment.download | message、resourceId | path（必须位于账号 downloads 子目录） |
 | tool.execute | tool、arguments、idempotencyKey、approved | 平台结果 |
-| subscribe / unsubscribe | conversation / conversationId | started / 空对象 |
+| subscribe / unsubscribe（兼容旧协议） | conversation / conversationId | 内置适配器拒绝 subscribe；unsubscribe 保留清理能力 |
 | cancel | id（通知） | 取消对应子进程 |
 | shutdown | 无 | closed=true，关闭自有消费者并退出 |
 
@@ -65,6 +67,6 @@ IM 插件使用 `kind: "im"`，增加 `entrypoints`，例如 `{"darwin-arm64":"b
 
 ## 诊断事件
 
-`diagnostic` 通知携带 `operation`、`detail`，可附 `conversationId`、`exitCode`。主应用再次脱敏后在 SQLite 的 diagnostics bucket 保存最近 200 条，GUI 底部“CLI 诊断记录”可查看和复制。适配器收集订阅退出前的 stderr 尾部，明确退订/关闭不报告意外退出。`sync.gap` 中 `disconnected: true` 表示订阅进程已退出，需要独立退避重连；普通解析缺口只补拉，不重建仍在运行的订阅。
+`diagnostic` 通知携带 `operation`、`detail`，可附 `conversationId`、`exitCode`。主应用再次脱敏后在 SQLite 的 diagnostics bucket 保存最近 200 条，GUI 底部“CLI 诊断记录”可查看和复制。当前主应用只轮询，不创建订阅；忽略旧订阅的就绪及断开通知，普通 `sync.gap` 通知仍可触发补拉。
 
 平台明确拒绝保密群消息时返回 `confidential_group`，主应用持久保存该会话的停拉策略，不再自动或手动拉取历史/增量，也不再建立订阅。首次发现依赖平台错误，未获得群保密属性前无法提前判断。

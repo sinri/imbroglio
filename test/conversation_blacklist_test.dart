@@ -83,7 +83,7 @@ void main() {
       await w.saveConversationBlacklist([]);
       await w.syncConversation(chat);
       expect(calls, contains('messages'));
-      expect(calls, contains('subscribe'));
+      expect(calls, isNot(contains('subscribe')));
     },
   );
 
@@ -216,29 +216,11 @@ void main() {
     },
   );
 
-  test('new rule unsubscribes an existing stream', () async {
+  test('new exclusion stops polling without subscription operations', () async {
     await w.syncConversation(chat);
     await exclude();
-    expect(calls, ['messages', 'subscribe', 'unsubscribe']);
-  });
-
-  test('rule added during subscribe stops the late subscription', () async {
-    final subscribed = Completer<void>();
-    final release = Completer<Json>();
-    w.clients['a'] = FakeRpc((method, _) {
-      calls.add(method);
-      if (method == 'subscribe') {
-        subscribed.complete();
-        return release.future;
-      }
-      return {'items': []};
-    });
-    final running = w.syncConversation(chat);
-    await subscribed.future;
-    await exclude();
-    release.complete({});
-    await running;
-    expect(calls, ['messages', 'subscribe', 'unsubscribe', 'unsubscribe']);
+    await w.syncConversation(chat);
+    expect(calls, ['messages']);
   });
 
   test('conversation refresh applies rules to renamed conversations', () async {
@@ -258,7 +240,7 @@ void main() {
     });
     await w.refreshConversations(w.accounts.single);
     expect(w.isConversationExcluded(chat), isTrue);
-    expect(calls.last, 'unsubscribe');
+    expect(calls.last, 'conversations');
     final before = calls.length;
     await w.syncConversation(chat);
     expect(calls.length, before);

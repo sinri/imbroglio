@@ -62,7 +62,7 @@ class _BlacklistDialogState extends State<ConversationBlacklistDialog> {
               mainAxisSize: MainAxisSize.min,
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                const Text('命中的会话仍显示在列表中并可搜索，停止自动拉取和实时订阅；点击打开会临时拉取消息，已有消息保留。'),
+                const Text('命中的会话仍显示在列表中并可搜索，停止自动拉取；点击打开会临时拉取消息，已有消息保留。'),
                 const SizedBox(height: 16),
                 Row(
                   children: [

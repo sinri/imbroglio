@@ -11,6 +11,7 @@ class RecordingAdapter extends adapter.Adapter {
   List<String> command = [];
   Object? response = {'items': []};
   String? stdinText;
+  List<Object?>? responses;
   RecordingAdapter(String source) {
     platform = source;
     binary = '/managed/cli';
@@ -30,11 +31,120 @@ class RecordingAdapter extends adapter.Adapter {
   }) async {
     command = args;
     stdinText = input;
-    return response;
+    return responses?.removeAt(0) ?? response;
   }
 }
 
 void main() {
+  test(
+    'DingTalk self identity matches exact user ID despite duplicate names',
+    () async {
+      final a = RecordingAdapter('dingtalk')
+        ..responses = [
+          [
+            {
+              'orgEmployeeModel': {
+                'userId': 'employee',
+                'orgUserName': 'Same Name',
+              },
+            },
+          ],
+          [
+            {'userId': 'other', 'name': 'Same Name', 'openDingTalkId': 'wrong'},
+            {
+              'userId': 'employee',
+              'name': 'Same Name',
+              'openDingTalkId': 'own-open',
+            },
+          ],
+        ];
+      final result = object(await a.handle(1, 'identity.self', {}));
+      expect(result, {
+        'userId': 'employee',
+        'ids': ['employee', 'own-open'],
+      });
+      expect(a.command, containsAllInOrder(['--profile', 'exact-profile']));
+    },
+  );
+  test(
+    'DingTalk self identity never accepts a matching name with a different user ID',
+    () async {
+      final a = RecordingAdapter('dingtalk')
+        ..responses = [
+          [
+            {
+              'orgEmployeeModel': {
+                'userId': 'employee',
+                'orgUserName': 'Same Name',
+              },
+            },
+          ],
+          [
+            {'userId': 'other', 'name': 'Same Name', 'openDingTalkId': 'wrong'},
+          ],
+        ];
+      await expectLater(
+        a.handle(1, 'identity.self', {}),
+        throwsA(isA<AppFailure>()),
+      );
+    },
+  );
+
+  test(
+    'notification settings preserve explicit muted and unmuted states',
+    () async {
+      final ding = RecordingAdapter('dingtalk')
+        ..response = {
+          'conversations': [
+            {'openConversationId': 'muted', 'notificationOff': 1},
+            {'openConversationId': 'normal', 'notificationOff': 0},
+            {'openConversationId': 'unknown'},
+          ],
+          'hasMore': false,
+        };
+      final snapshot = object(
+        await ding.handle(1, 'notifications.settings', {
+          'ids': ['muted'],
+        }),
+      );
+      expect(snapshot['items'], [
+        {'id': 'muted', 'muted': true},
+        {'id': 'normal', 'muted': false},
+      ]);
+      expect(ding.command, isNot(contains('--exclude-muted')));
+      final feishu = RecordingAdapter('feishu')
+        ..response = {
+          'items': [
+            {'chat_id': 'muted', 'is_muted': true},
+            {'chat_id': 'normal', 'is_muted': false},
+            {'chat_id': 'unknown'},
+          ],
+        };
+      final batch = object(
+        await feishu.handle(1, 'notifications.settings', {
+          'ids': ['muted', 'normal', 'unknown'],
+        }),
+      );
+      expect(batch['items'], snapshot['items']);
+      expect(
+        feishu.command,
+        containsAllInOrder(['chat.user_setting', 'batch_query']),
+      );
+      expect(feishu.command, containsAllInOrder(['--as', 'user']));
+    },
+  );
+
+  test('incomplete DingTalk notification snapshot is not accepted', () async {
+    final ding = RecordingAdapter('dingtalk')
+      ..response = {'conversations': [], 'hasMore': true};
+    await expectLater(
+      ding.handle(1, 'notifications.settings', {
+        'ids': ['chat'],
+      }),
+      throwsA(isA<AppFailure>()),
+    );
+  });
+
   test(
     'DingTalk active continuation uses endpoint exhaustion metadata',
     () async {

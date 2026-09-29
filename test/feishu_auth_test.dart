@@ -166,6 +166,10 @@ void main() {
       w.conversations = [chat];
       final incoming = <Message>[];
       w.onIncoming = incoming.add;
+      await w.store.put('notificationSettings', chat.key, {
+        'muted': false,
+        'checkedAt': DateTime.now().millisecondsSinceEpoch,
+      }, account: account.id);
       final time = DateTime.now().millisecondsSinceEpoch + 1000;
       w.rpc = FakeRpc(
         (_, _) => {

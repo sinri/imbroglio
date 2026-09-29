@@ -147,7 +147,7 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
                       const SizedBox(height: 16),
                       Text(
                         id == 'dingtalk'
-                            ? '个人消息订阅 · 会话收发 · 文档和待办'
+                            ? '消息轮询 · 会话收发 · 文档和待办'
                             : '用户身份沟通 · 个人会话定时同步 · 文档和待办',
                       ),
                       if (progress[id] != null) ...[

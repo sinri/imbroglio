@@ -242,7 +242,6 @@ class Adapter {
             'reply': ['chat', 'message', 'reply'],
             'resources.search': ['doc', 'search'],
             'resources.read': ['doc', 'read'],
-            'subscribe': ['event', 'consume'],
           }
         : <String, List<String>>{
             'conversations': ['im', '+chat-list'],
@@ -264,10 +263,7 @@ class Adapter {
         capabilities[entry.key] = {'state': 'unsupported'};
       }
     }
-    capabilities['sync'] = {
-      'mode': platform == 'dingtalk' ? 'subscription' : 'poll',
-      'identity': 'user',
-    };
+    capabilities['sync'] = {'mode': 'poll', 'identity': 'user'};
     capabilities['readReceipts'] = {'state': 'unsupported'};
     capabilities['credentials'] = {'isolated': false};
   }
@@ -275,7 +271,7 @@ class Adapter {
   List<String> target(Json j) {
     if (j['kind'] == 'p2p') {
       if ('${j['peerId'] ?? ''}'.isEmpty) {
-        throw const AppFailure('unsupported', '该单聊缺少对端用户标识，请先通过联系人查找打开单聊');
+        throw const AppFailure('unsupported', '钉钉未提供此单聊的对端标识，当前接口暂时无法操作该会话');
       }
       return ['--open-dingtalk-id', j['peerId']];
     }
@@ -472,6 +468,101 @@ class Adapter {
           'cursor': next,
           'complete': complete,
         };
+      case 'identity.self':
+        if (platform != 'dingtalk') {
+          throw const AppFailure('unsupported', '当前平台无需映射身份');
+        }
+        final self =
+            rows(await run(id, scoped(['contact', 'user', 'get-self'])))
+                .map((j) => object(j['orgEmployeeModel']))
+                .where((j) => field(j, ['userId']).isNotEmpty)
+                .toList();
+        if (self.length != 1) throw const AppFailure('identity', '当前钉钉用户身份不明确');
+        final userId = field(self.single, ['userId']);
+        final name = field(self.single, ['orgUserName']);
+        if (name.isEmpty) throw const AppFailure('identity', '当前钉钉用户资料不完整');
+        final matches =
+            rows(
+                  await run(
+                    id,
+                    scoped(['contact', 'user', 'search', '--query', name]),
+                  ),
+                )
+                .where((j) => field(j, ['userId']) == userId)
+                .map((j) => field(j, ['openDingTalkId', 'openDingtalkId']))
+                .where((id) => id.isNotEmpty)
+                .toSet();
+        if (matches.length != 1) {
+          throw const AppFailure('identity', '无法唯一匹配当前用户的消息身份');
+        }
+        return {
+          'userId': userId,
+          'ids': [userId, matches.single],
+        };
+      case 'notifications.settings':
+        final requested = (args['ids'] as List).cast<String>().toSet();
+        if (requested.isEmpty || requested.length > 10) {
+          throw const AppFailure('contract', '通知设置查询需要 1–10 个会话');
+        }
+        final settings = <Json>[];
+        if (platform == 'feishu') {
+          final value = await run(
+            id,
+            scoped([
+              'im',
+              'chat.user_setting',
+              'batch_query',
+              '--data',
+              jsonEncode({'chat_ids': requested.toList()}),
+            ], user: true),
+          );
+          for (final row in rows(value)) {
+            if (requested.contains(row['chat_id']) && row['is_muted'] is bool) {
+              settings.add({'id': row['chat_id'], 'muted': row['is_muted']});
+            }
+          }
+        } else {
+          // DingTalk exposes notificationOff on the account conversation list,
+          // not conversation-info. Return a complete snapshot for host caching.
+          var cursor = '';
+          final seen = <String>{};
+          for (var page = 0; ; page++) {
+            if (page >= 1000) throw const AppFailure('contract', '通知设置列表未完成');
+            final value = object(
+              await run(
+                id,
+                scoped([
+                  'chat',
+                  'list-all-conversations',
+                  '--limit',
+                  '100',
+                  if (cursor.isNotEmpty) ...['--cursor', cursor],
+                ]),
+              ),
+            );
+            for (final row in rows(value)) {
+              final muted = row['notificationOff'];
+              final chatId = field(row, [
+                'openConversationId',
+                'conversationId',
+              ]);
+              if (chatId.isNotEmpty &&
+                  (muted == 0 || muted == 1 || muted is bool)) {
+                settings.add({
+                  'id': chatId,
+                  'muted': muted == true || muted == 1,
+                });
+              }
+            }
+            if (value['hasMore'] == false) break;
+            final next = field(value, ['nextCursor']);
+            if (next.isEmpty || !seen.add(next)) {
+              throw const AppFailure('contract', '通知设置分页无法继续');
+            }
+            cursor = next;
+          }
+        }
+        return {'items': settings};
       case 'conversations':
         final value = await run(
           id,
@@ -1042,95 +1133,7 @@ class Adapter {
         }
         throw const AppFailure('unsupported', '未注册的业务工具');
       case 'subscribe':
-        if (platform != 'dingtalk') {
-          throw const AppFailure('unsupported', '飞书个人会话采用定时同步');
-        }
-        final c = object(args['conversation']);
-        if (streams.containsKey(c['id'])) return {};
-        final command = [
-          'event',
-          'consume',
-          c['kind'] == 'p2p'
-              ? 'user_im_message_receive_o2o'
-              : 'user_im_message_receive_group',
-          ...target(c),
-          '--format',
-          'ndjson',
-          if (profile.isNotEmpty) ...['--profile', profile],
-        ];
-        final child = await Process.start(
-          binary,
-          command,
-          workingDirectory: directory,
-          environment: environment,
-          includeParentEnvironment: false,
-        );
-        streams[c['id']] = child;
-        var errorTail = '';
-        final outputDone = child.stdout
-            .transform(const Utf8Decoder(allowMalformed: true))
-            .transform(const LineSplitter())
-            .forEach((line) {
-              try {
-                final j = object(unwrap(jsonDecode(line)));
-                emit({
-                  'method': 'message',
-                  'params': normalizeMessage(
-                    accountId,
-                    c['id'],
-                    object(j['payload'] ?? j),
-                  ).toJson(),
-                });
-              } catch (e) {
-                diagnostic(
-                  'event.decode',
-                  '消息事件解析失败：${e.runtimeType}',
-                  conversationId: '${c['id']}',
-                );
-                emit({
-                  'method': 'sync.gap',
-                  'params': {'conversationId': c['id'], 'reason': '事件解析失败，需补拉'},
-                });
-              }
-            });
-        final errorDone = child.stderr
-            .transform(const Utf8Decoder(allowMalformed: true))
-            .transform(const LineSplitter())
-            .forEach((line) {
-              errorTail += '$line\n';
-              if (errorTail.length > 16384) {
-                errorTail = errorTail.substring(errorTail.length - 16384);
-              }
-              if (line.contains('ready')) {
-                emit({
-                  'method': 'sync.ready',
-                  'params': {'conversationId': c['id']},
-                });
-              }
-            });
-        unawaited(() async {
-          final code = await child.exitCode;
-          await Future.wait([outputDone, errorDone]);
-          // Explicit unsubscribe/shutdown must not trigger an error or reconnect.
-          if (!identical(streams[c['id']], child)) return;
-          streams.remove(c['id']);
-          final detail = diagnosticText(errorTail);
-          diagnostic(
-            'event consume',
-            detail.isEmpty ? '订阅进程退出，没有错误输出' : detail,
-            exitCode: code,
-            conversationId: '${c['id']}',
-          );
-          emit({
-            'method': 'sync.gap',
-            'params': {
-              'conversationId': c['id'],
-              'disconnected': true,
-              'reason': '订阅已断开 ($code)${detail.isEmpty ? '' : '：$detail'}',
-            },
-          });
-        }());
-        return {'started': true};
+        throw const AppFailure('unsupported', '实时订阅已停用，消息通过轮询同步');
       case 'unsubscribe':
         final child = streams.remove(args['conversationId']);
         await child?.stdin.close();

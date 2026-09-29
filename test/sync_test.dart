@@ -71,6 +71,10 @@ void main() {
       ..accounts = [account]
       ..conversations = [conversation];
     await w.store.init();
+    await w.store.put('notificationSettings', conversation.key, {
+      'muted': false,
+      'checkedAt': DateTime.now().millisecondsSinceEpoch,
+    }, account: account.id);
   });
   tearDown(() async {
     await w.close();
@@ -79,6 +83,50 @@ void main() {
     }
     temporaryDirectories.clear();
   });
+  test(
+    'unresolved DingTalk direct chats skip all read entry points and recover after enrichment',
+    () async {
+      w.accounts = [
+        const AccountRef(id: 'a', platform: 'dingtalk', label: 'Ding'),
+      ];
+      const unresolved = Conversation(
+        accountId: 'a',
+        id: 'c',
+        title: 'OA审批助手',
+        kind: 'p2p',
+      );
+      w.conversations = [unresolved];
+      var reads = 0;
+      w.clients['a'] = FakeRpc((method, args) {
+        if (method == 'messages') {
+          reads++;
+          expect(object(args['conversation'])['peerId'], 'resolved-peer');
+        }
+        return {'items': [], 'hasMore': false};
+      });
+      await w.selectConversation(unresolved);
+      await w.syncConversation(unresolved, older: true, manual: true);
+      expect(reads, 0);
+      expect(w.sync[unresolved.key]!.mode, '缺少读取标识');
+      expect(w.sync[unresolved.key]!.failures, 0);
+      expect(await w.store.get('cursors', unresolved.key), isNull);
+      expect(w.backgroundPending, 0);
+      w.conversations = [
+        const Conversation(
+          accountId: 'a',
+          id: 'c',
+          title: 'OA审批助手',
+          kind: 'p2p',
+          peerId: 'resolved-peer',
+        ),
+      ];
+      await w.syncConversation(unresolved);
+      expect(reads, 1);
+      expect(w.sync[unresolved.key]!.error, isEmpty);
+      expect(w.sync[unresolved.key]!.mode, isNot('缺少读取标识'));
+    },
+  );
+
   test(
     'three tiers cool idle chats and revisit them after three hours',
     () async {

@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:imbroglio/src/core/diagnostics.dart';
+import 'package:imbroglio/src/core/cli_failure.dart';
 import 'package:imbroglio/src/core/models.dart';
 import 'package:imbroglio/src/services/store.dart';
 import 'package:imbroglio/src/services/workspace.dart';
@@ -37,6 +38,28 @@ class DiagnosticAdapter extends adapter.Adapter {
 }
 
 void main() {
+  test('event CLI error preserves retry guidance after a migration warning', () {
+    final deadline = DateTime.now().toUtc().add(const Duration(hours: 1));
+    final error = cliFailure(
+      1,
+      '⚠️  检测到旧升级器留下的嵌套 Skill\n${const JsonEncoder.withIndent('  ').convert({
+        'error': {'message': 'SYSTEM_ERROR: registerToEventCenter failed', 'retry_after_seconds': 2101, 'next_retry_at': deadline.toIso8601String()},
+      })}',
+      '',
+    );
+    expect(error.message, contains('registerToEventCenter failed'));
+    expect(error.message, isNot(contains('Skill')));
+    expect(error.retryAfter, greaterThanOrEqualTo(3599));
+    final secondsOnly = cliFailure(
+      1,
+      jsonEncode({
+        'error': {'message': 'failed', 'retry_after_seconds': 2101},
+      }),
+      '',
+    );
+    expect(secondsOnly.retryAfter, 2101);
+  });
+
   for (final completed in [true, false]) {
     test(
       'exit 3 ${completed ? 'accepts explicit completed login with missing scopes' : 'rejects actual authorization failure'}',
@@ -229,36 +252,25 @@ exit 3
   );
 
   test(
-    'subscription failure backs off while message polling continues',
+    'watched selected chats poll without subscribing and discard legacy retries',
     () async {
-      var subscriptions = 0, fetches = 0;
+      final calls = <String>[];
       w.clients['a'] = FakeRpc((method, args) {
-        if (method == 'subscribe') {
-          subscriptions++;
-          throw const AppFailure(
-            'upstream',
-            'SYSTEM_ERROR registerToEventCenter failed',
-          );
-        }
-        if (method == 'messages') {
-          fetches++;
-          return {'items': [], 'hasMore': false};
-        }
-        return {};
+        calls.add(method);
+        return {'items': [], 'hasMore': false};
       });
-      await w.syncConversation(c);
-      await w.syncConversation(c);
-      expect(subscriptions, 1);
-      expect(fetches, 2);
-      final retry = await w.store.get('subscriptionRetry', c.key);
-      expect(retry!['failures'], 1);
-      expect(
-        retry['retryAt'],
-        greaterThan(DateTime.now().millisecondsSinceEpoch),
-      );
+      await w.store.put('subscriptionRetry', c.key, {
+        'accountId': 'a',
+        'conversationId': c.id,
+        'failures': 3,
+        'retryAt': 9999999999999,
+      });
       await w.loadSyncPolicies();
+      expect(await w.store.get('subscriptionRetry', c.key), isNull);
+      await w.selectConversation(c);
       await w.syncConversation(c);
-      expect(subscriptions, 1);
+      expect(calls.where((v) => v == 'messages').length, 2);
+      expect(calls, isNot(contains('subscribe')));
     },
   );
 
@@ -290,67 +302,17 @@ exit 3
     expect(cli.captured.single['detail'], contains('final failure'));
   });
 
-  test(
-    'subscription captures the last stderr line before reporting exit',
-    () async {
-      final dir = await Directory.systemTemp.createTemp(
-        'imbroglio-subscription-',
-      );
-      try {
-        final script = File('${dir.path}/cli');
-        await script.writeAsString(
-          '#!/bin/sh\nprintf "SYSTEM_ERROR registerToEventCenter failed\\n" >&2\nexit 9\n',
-        );
-        await Process.run('chmod', ['+x', script.path]);
-        final cli = DiagnosticAdapter()
-          ..binary = script.path
-          ..directory = dir.path
-          ..platform = 'dingtalk'
-          ..accountId = 'a'
-          ..initialized = true;
-        await cli.handle(1, 'subscribe', {'conversation': c.toJson()});
-        await cli.received.future.timeout(const Duration(seconds: 5));
-        expect(cli.captured.single['exitCode'], 9);
-        expect(
-          cli.captured.single['detail'],
-          contains('registerToEventCenter failed'),
-        );
-        expect(cli.streams, isEmpty);
-      } finally {
-        await dir.delete(recursive: true);
-      }
-    },
-  );
-
-  test(
-    'intentional unsubscribe does not create an unexpected exit record',
-    () async {
-      final dir = await Directory.systemTemp.createTemp(
-        'imbroglio-unsubscribe-',
-      );
-      try {
-        final script = File('${dir.path}/cli');
-        await script.writeAsString(
-          '#!/bin/sh\ncat >/dev/null\nprintf "closed\\n" >&2\n',
-        );
-        await Process.run('chmod', ['+x', script.path]);
-        final cli = DiagnosticAdapter()
-          ..binary = script.path
-          ..directory = dir.path
-          ..platform = 'dingtalk'
-          ..accountId = 'a'
-          ..initialized = true;
-        await cli.handle(1, 'subscribe', {'conversation': c.toJson()});
-        final child = cli.streams[c.id]!;
-        await cli.handle(2, 'unsubscribe', {'conversationId': c.id});
-        await child.exitCode.timeout(const Duration(seconds: 5));
-        await Future<void>.delayed(const Duration(milliseconds: 50));
-        expect(cli.captured, isEmpty);
-      } finally {
-        await dir.delete(recursive: true);
-      }
-    },
-  );
+  test('adapter rejects subscriptions without launching a consumer', () async {
+    final cli = DiagnosticAdapter()
+      ..platform = 'dingtalk'
+      ..accountId = 'a'
+      ..initialized = true;
+    await expectLater(
+      cli.handle(1, 'subscribe', {'conversation': c.toJson()}),
+      throwsA(isA<wire.AppFailure>()),
+    );
+    expect(cli.streams, isEmpty);
+  });
 
   testWidgets('diagnostic records are visible from the persistent footer', (
     tester,

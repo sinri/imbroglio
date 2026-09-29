@@ -67,13 +67,20 @@ AppFailure cliFailure(int exitCode, String stderr, String stdout) {
   var kind = '${e['type'] ?? 'upstream'}';
   if (e['code'] == 429 || e['subtype'] == 'rate_limit') kind = 'rate_limit';
   if (exitCode == 10) kind = 'confirmation';
+  var retryAfter = int.tryParse(
+    '${e['retry_after_seconds'] ?? e['retry_after'] ?? e['retryAfter'] ?? j['retry_after']}',
+  );
+  final retryAt = DateTime.tryParse('${e['next_retry_at'] ?? ''}');
+  if (retryAt != null) {
+    final seconds = (retryAt.difference(DateTime.now()).inMilliseconds / 1000)
+        .ceil();
+    if (seconds > (retryAfter ?? 0)) retryAfter = seconds;
+  }
   return AppFailure(
     kind,
     summary.isEmpty
         ? 'CLI 请求失败 ($exitCode)，请查看 CLI 诊断记录'
         : 'CLI 请求失败 ($exitCode)：$summary',
-    retryAfter: int.tryParse(
-      '${e['retry_after'] ?? e['retryAfter'] ?? j['retry_after']}',
-    ),
+    retryAfter: retryAfter,
   );
 }

@@ -78,8 +78,6 @@ class Workspace extends ChangeNotifier {
   final _streams = <String>{};
   final blockedConversations = <String>{};
   final diagnostics = <Json>[];
-  final _subscriptionRetry = <String, DateTime>{};
-  final _subscriptionFailures = <String, int>{};
 
   Future<void> recordDiagnostic(AccountRef a, Json input) async {
     if (closing ||
@@ -190,41 +188,16 @@ class Workspace extends ChangeNotifier {
           ..error = '保密群不支持读取消息，已停止拉取';
       }
     }
+    // Polling supersedes all persisted subscription reconnect requests.
     for (final row in await store.list('subscriptionRetry', limit: 100000)) {
       final key = compositeKey(row['accountId'], row['conversationId']);
-      _subscriptionFailures[key] = row['failures'] as int? ?? 0;
-      _subscriptionRetry[key] = DateTime.fromMillisecondsSinceEpoch(
-        row['retryAt'] as int? ?? 0,
-      );
+      await store.remove('subscriptionRetry', key);
+      final state = sync[key];
+      if (state != null && state.mode.contains('订阅')) {
+        state.mode = '定时同步';
+        state.error = '';
+      }
     }
-  }
-
-  Future<void> _subscriptionFailed(
-    AccountRef a,
-    String conversationId,
-    String reason,
-  ) async {
-    final key = compositeKey(a.id, conversationId);
-    final failures = (_subscriptionFailures[key] ?? 0) + 1;
-    _subscriptionFailures[key] = failures;
-    final retry = DateTime.now().add(
-      Duration(
-        seconds: (30 * (1 << (failures - 1).clamp(0, 5))).clamp(30, 900),
-      ),
-    );
-    _subscriptionRetry[key] = retry;
-    final state = sync[key] ??= SyncState();
-    state.mode = '定时同步（订阅待重连）';
-    state.error = diagnosticText(reason);
-    activities
-        .begin('subscription:$key', '恢复实时订阅', a.label)
-        .finish(state: 'waiting', detail: state.error, retryAt: retry);
-    await store.put('subscriptionRetry', key, {
-      'accountId': a.id,
-      'conversationId': conversationId,
-      'failures': failures,
-      'retryAt': retry.millisecondsSinceEpoch,
-    }, account: a.id);
   }
 
   Future<void> _blockConfidential(Conversation c) async {
@@ -261,6 +234,105 @@ class Workspace extends ChangeNotifier {
       chatVisible && windowFocused && selectedConversation?.key == c.key;
   Timer? _timer;
   RandomAccessFile? _instanceLock;
+  final _notificationRefresh = <String, Future<void>>{};
+  final _notificationRetry = <String, DateTime>{};
+
+  /// Unknown settings suppress notifications, never message persistence/unread.
+  Future<bool> notificationAllowed(Message message) async {
+    final a = account(message.accountId);
+    if (_isOwn(message)) return false;
+    if (a.platform == 'dingtalk' &&
+        a.userId.isNotEmpty &&
+        !_selfIds.containsKey(
+          compositeKey(a.id, compositeKey(a.profile, a.userId)),
+        )) {
+      return false; // Do not notify before the current sender identity is verified.
+    }
+    final key = compositeKey(a.id, message.conversationId);
+    var policy = await store.get('notificationSettings', key);
+    bool retryBlocked() => [
+      _notificationRetry[a.id],
+      _notificationRetry[key],
+    ].any((at) => at?.isAfter(DateTime.now()) ?? false);
+    bool fresh(Json? p) =>
+        p?['muted'] is bool &&
+        DateTime.now().millisecondsSinceEpoch - (p?['checkedAt'] as int? ?? 0) <
+            60000;
+    if (!fresh(policy) && !retryBlocked()) {
+      // Share an account refresh. A second caller outside the first batch can
+      // then query its own batch without duplicating the first request.
+      final pending = _notificationRefresh[a.id];
+      if (pending != null) await pending;
+      policy = await store.get('notificationSettings', key);
+      if (!fresh(policy) && !retryBlocked()) {
+        final work = _refreshNotificationSettings(a, message.conversationId);
+        _notificationRefresh[a.id] = work;
+        try {
+          await work;
+        } finally {
+          if (identical(_notificationRefresh[a.id], work)) {
+            _notificationRefresh.remove(a.id);
+          }
+        }
+        policy = await store.get('notificationSettings', key);
+      }
+    }
+    return policy?['muted'] == false;
+  }
+
+  Future<void> _refreshNotificationSettings(AccountRef a, String chatId) async {
+    try {
+      final ids = <String>{chatId};
+      final hotSince = DateTime.now()
+          .subtract(const Duration(hours: 1))
+          .millisecondsSinceEpoch;
+      for (final c in conversations.where(
+        (c) => c.accountId == a.id && c.updatedAt >= hotSince,
+      )) {
+        if (ids.length >= 10) break;
+        ids.add(c.id);
+      }
+      final result = object(
+        await (await client(
+          a,
+        )).call('notifications.settings', {'ids': ids.toList()}),
+      );
+      if (result['items'] is! List) {
+        throw const AppFailure('contract', '通知设置响应不完整');
+      }
+      final now = DateTime.now().millisecondsSinceEpoch;
+      for (final raw in result['items'] as List) {
+        final row = object(raw);
+        if (row['id'] is! String || row['muted'] is! bool) continue;
+        await store.put('notificationSettings', compositeKey(a.id, row['id']), {
+          'muted': row['muted'],
+          'checkedAt': now,
+        }, account: a.id);
+      }
+      _notificationRetry.remove(a.id);
+      // Missing/invalid IDs remain unknown without blocking other chats.
+      for (final id in ids) {
+        final key = compositeKey(a.id, id);
+        final policy = await store.get('notificationSettings', key);
+        if (policy?['checkedAt'] != now) {
+          _notificationRetry[key] = DateTime.now().add(
+            const Duration(seconds: 30),
+          );
+        } else {
+          _notificationRetry.remove(key);
+        }
+      }
+    } catch (e) {
+      _notificationRetry[a.id] = DateTime.now().add(
+        const Duration(seconds: 30),
+      );
+      await recordDiagnostic(a, {
+        'operation': 'notifications.settings',
+        'detail': '免打扰状态暂不可用，保留已有设置；未知状态暂不通知：$e',
+      });
+    }
+  }
+
   void Function(Message message)? onIncoming;
   VoidCallback? requestMessagesPage;
   AccountRef account(String id) => accounts.firstWhere((a) => a.id == id);
@@ -482,7 +554,9 @@ class Workspace extends ChangeNotifier {
                 m.timestamp >
                     (_readAt[compositeKey(m.accountId, m.conversationId)] ??
                         0)) {
-              onIncoming?.call(m);
+              if (onIncoming != null && await notificationAllowed(m)) {
+                onIncoming?.call(m);
+              }
             }
           }
           if (selectedConversation?.key ==
@@ -494,35 +568,15 @@ class Workspace extends ChangeNotifier {
           changed();
         }
       case 'sync.ready':
-        final key = compositeKey(a.id, '${params['conversationId']}');
-        if (blockedConversations.contains(key) ||
-            _excludedKey(a.id, '${params['conversationId']}')) {
-          return;
-        }
-        final wasRetrying = _subscriptionFailures.remove(key) != null;
-        _subscriptionRetry.remove(key);
-        if (wasRetrying) {
-          activities
-              .begin('subscription:$key', '恢复实时订阅', a.label)
-              .finish(detail: '实时订阅已恢复');
-        }
-        await store.remove('subscriptionRetry', key);
-        (sync[key] ??= SyncState()).mode = '实时订阅';
-        changed();
+        // Ignore notifications from a legacy subscription during shutdown.
+        return;
       case 'sync.gap':
         final key = compositeKey(a.id, '${params['conversationId']}');
         if (blockedConversations.contains(key) ||
             _excludedKey(a.id, '${params['conversationId']}')) {
           return;
         }
-        if (params['disconnected'] == true) {
-          _streams.remove(key);
-          await _subscriptionFailed(
-            a,
-            '${params['conversationId']}',
-            '${params['reason']}',
-          );
-        }
+        if (params['disconnected'] == true) return;
         final state = sync[key] ??= SyncState();
         state.gap = true;
         state.error = diagnosticText('${params['reason']}');
@@ -863,9 +917,12 @@ class Workspace extends ChangeNotifier {
         capabilities,
         _backoff,
         _next,
-        _subscriptionRetry,
-        _subscriptionFailures,
         senderProfiles,
+        _notificationRefresh,
+        _notificationRetry,
+        _selfIds,
+        _selfIdentityPending,
+        _selfIdentityRetry,
         _readAt,
         _seenPlatformTime,
         _attachments,
@@ -1074,10 +1131,70 @@ class Workspace extends ChangeNotifier {
     await syncConversation(c, manual: isConversationExcluded(c));
   }
 
-  bool _isOwn(Message m) =>
-      m.extra['isOwn'] == true ||
-      (account(m.accountId).userId.isNotEmpty &&
-          account(m.accountId).userId == m.senderId);
+  final _selfIds = <String, Set<String>>{};
+  final _selfIdentityPending = <String, Future<void>>{};
+  final _selfIdentityRetry = <String, DateTime>{};
+
+  Future<void> _ensureSelfIdentity(AccountRef a) async {
+    if (a.platform != 'dingtalk' || a.userId.isEmpty) return;
+    final scope = compositeKey(a.profile, a.userId);
+    final key = compositeKey(a.id, scope);
+    if (_selfIds.containsKey(key) ||
+        (_selfIdentityRetry[key]?.isAfter(DateTime.now()) ?? false)) {
+      return;
+    }
+    final pending = _selfIdentityPending[key];
+    if (pending != null) return pending;
+    final work = (() async {
+      try {
+        var value = await store.get('selfIdentity', key);
+        if (value == null) {
+          value = object(await (await client(a)).call('identity.self'));
+          if (value['userId'] != a.userId || value['ids'] is! List) {
+            throw const AppFailure('identity', '钉钉消息身份与当前账号不匹配');
+          }
+          await store.put('selfIdentity', key, value, account: a.id);
+        }
+        if (value['userId'] != a.userId) {
+          throw const AppFailure('identity', '钉钉身份缓存不匹配');
+        }
+        _selfIds[key] = (value['ids'] as List)
+            .whereType<String>()
+            .where((v) => v.isNotEmpty)
+            .toSet();
+      } catch (e) {
+        _selfIdentityRetry[key] = DateTime.now().add(
+          const Duration(seconds: 30),
+        );
+        await recordDiagnostic(a, {
+          'operation': 'identity.self',
+          'detail': '$e',
+        });
+      }
+    })();
+    _selfIdentityPending[key] = work;
+    try {
+      await work;
+    } finally {
+      _selfIdentityPending.remove(key);
+    }
+  }
+
+  bool _isOwn(Message m) {
+    if (m.extra['isOwn'] == true) return true;
+    final a = account(m.accountId);
+    final own = {
+      if (a.userId.isNotEmpty) a.userId,
+      ...?_selfIds[compositeKey(a.id, compositeKey(a.profile, a.userId))],
+    };
+    final raw = object(m.extra['raw']);
+    return [
+      m.senderId,
+      raw['senderId'],
+      raw['senderUserId'],
+      raw['senderOpenDingTalkId'],
+    ].whereType<String>().where((id) => id.isNotEmpty).any(own.contains);
+  }
 
   Future<void> markRead(Conversation c) => store.db.transaction(() async {
     final latest = conversations.where((v) => v.key == c.key).firstOrNull ?? c;
@@ -1350,17 +1467,33 @@ class Workspace extends ChangeNotifier {
     }
   });
 
+  bool _missingReadIdentity(Conversation c) =>
+      account(c.accountId).platform == 'dingtalk' &&
+      (c.kind == 'unknown' || (c.kind == 'p2p' && c.peerId.isEmpty));
+
   Future<void> syncConversation(
     Conversation c, {
     bool older = false,
     bool manual = false,
   }) async {
+    // Selection and history actions can retain an older conversation snapshot.
+    c = conversations.where((v) => v.key == c.key).firstOrNull ?? c;
+    if (_missingReadIdentity(c)) {
+      final state = sync[c.key] ??= SyncState();
+      state.mode = '缺少读取标识';
+      state.error = '钉钉未提供此会话的对端标识，当前接口暂时无法读取；会话详情补齐后自动恢复。';
+      state.failures = 0;
+      _backoff.remove(c.key);
+      changed();
+      return;
+    }
     if ((!manual && isConversationExcluded(c)) ||
         blockedConversations.contains(c.key) ||
         !_busy.add(c.key)) {
       return;
     }
     final state = sync[c.key] ??= SyncState();
+    if (state.mode == '缺少读取标识') state.mode = '定时同步';
     BackgroundActivity? activity;
     var received = 0, fetchedPages = 0;
     try {
@@ -1373,6 +1506,7 @@ class Workspace extends ChangeNotifier {
       );
       activity.progress('正在请求消息');
       final rpc = await client(a);
+      await _ensureSelfIdentity(a);
       final saved = await store.get('cursors', c.key);
       final initial =
           saved?['timestamp'] == null && saved?['resumeSince'] == null;
@@ -1421,9 +1555,15 @@ class Workspace extends ChangeNotifier {
         final items = (result['items'] as List? ?? [])
             .map((j) => Message.fromJson(object(j)))
             .toList();
-        for (final m in items) {
+        for (var m in items) {
           if (m.accountId != a.id || m.conversationId != c.id) {
             throw const AppFailure('identity', '消息来源不匹配');
+          }
+          if (_isOwn(m) && m.extra['isOwn'] != true) {
+            m = Message.fromJson({
+              ...m.toJson(),
+              'extra': {...m.extra, 'isOwn': true},
+            });
           }
           if (pageOldest == null || m.timestamp < pageOldest) {
             pageOldest = m.timestamp;
@@ -1438,7 +1578,9 @@ class Workspace extends ChangeNotifier {
                 m.timestamp >
                     (_readAt[compositeKey(m.accountId, m.conversationId)] ??
                         0)) {
-              onIncoming?.call(m);
+              if (onIncoming != null && await notificationAllowed(m)) {
+                onIncoming?.call(m);
+              }
             }
           }
           if (m.timestamp > maxTime) maxTime = m.timestamp;
@@ -1516,27 +1658,6 @@ class Workspace extends ChangeNotifier {
       state.lastSuccess = DateTime.now().millisecondsSinceEpoch;
       state.failures = 0;
       _backoff.remove(c.key);
-      if (!isConversationExcluded(c) &&
-          a.platform == 'dingtalk' &&
-          (c.watched || c.key == selectedConversation?.key) &&
-          !_streams.contains(c.key) &&
-          !(_subscriptionRetry[c.key]?.isAfter(DateTime.now()) ?? false)) {
-        _streams.add(c.key);
-        try {
-          await rpc.call('subscribe', {'conversation': c.toJson()});
-          // A rule may have unsubscribed while subscribe was still pending.
-          if (isConversationExcluded(c)) _streams.add(c.key);
-          await _stopExcludedSubscriptions();
-        } catch (e) {
-          _streams.remove(c.key);
-          await _subscriptionFailed(a, c.id, '$e');
-          await recordDiagnostic(a, {
-            'operation': 'subscribe',
-            'conversationId': c.id,
-            'detail': '$e',
-          });
-        }
-      }
       if (selectedConversation?.key == c.key && !closing) await loadMessages();
       if (!older && state.gap) {
         _next[c.key] = DateTime.now().add(
@@ -1583,6 +1704,7 @@ class Workspace extends ChangeNotifier {
       .where(
         (c) =>
             account(c.accountId).enabled &&
+            !_missingReadIdentity(c) &&
             !blockedConversations.contains(c.key) &&
             !isConversationExcluded(c) &&
             !_historyDone.contains(c.key) &&
@@ -1682,9 +1804,7 @@ class Workspace extends ChangeNotifier {
         .where(
           (c) =>
               available(c.accountId) &&
-              !(platform == 'dingtalk' &&
-                  (c.kind == 'unknown' ||
-                      (c.kind == 'p2p' && c.peerId.isEmpty))) &&
+              !_missingReadIdentity(c) &&
               !blockedConversations.contains(c.key) &&
               !isConversationExcluded(c),
         )
