@@ -19,6 +19,7 @@
 | auth.configure | 可选 appId、appSecret（仅传入 stdin） | configured |
 | auth.login | 无 | completed；过程中通知 auth.url |
 | auth.status / auth.logout | 无 | 状态 / 空对象 |
+| conversations.active（内置 IM） | start/end（Unix 毫秒）、可选 cursor；分页保持相同时间窗口 | items: Conversation[]（活跃摘要）、cursor、complete（布尔，仅分页耗尽为 true） |
 | conversations | 可选 cursor | items: Conversation[]、cursor |
 | messages | conversation、可选 before/since/notBefore（毫秒）/cursor；notBefore 是自动初始化历史的下限，不改变倒序分页方向 | items: Message[]、cursor、hasMore |
 | send | conversation、text、reply、attachment、image、markdown、idempotencyKey、approved | result、messageId |

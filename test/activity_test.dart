@@ -41,43 +41,64 @@ void main() {
     expect(log.items.single.detail, contains('offline'));
   });
 
-  testWidgets('status bar opens live details with progress and retry time', (
-    tester,
-  ) async {
-    final w = Workspace();
-    final task = w.activities.begin('sync', '拉取新消息', '工作账号 · 测试群');
-    task.progress('已拉取 2 页 · 80 条消息');
-    await tester.binding.setSurfaceSize(const Size(1000, 740));
-    addTearDown(() => tester.binding.setSurfaceSize(null));
-    await tester.pumpWidget(
-      ProviderScope(
-        overrides: [workspaceProvider.overrideWith((ref) => w)],
-        child: const MaterialApp(
-          home: Scaffold(
-            body: Align(
-              alignment: Alignment.bottomCenter,
-              child: BackgroundActivityBar(),
+  testWidgets(
+    'activity details refresh periodically and can freeze mutable progress',
+    (tester) async {
+      final w = Workspace();
+      final task = w.activities.begin('sync', '拉取新消息', '工作账号 · 测试群');
+      task.progress('已拉取 2 页 · 80 条消息');
+      await tester.binding.setSurfaceSize(const Size(1000, 740));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      await tester.pumpWidget(
+        ProviderScope(
+          overrides: [workspaceProvider.overrideWith((ref) => w)],
+          child: const MaterialApp(
+            home: Scaffold(
+              body: Align(
+                alignment: Alignment.bottomCenter,
+                child: BackgroundActivityBar(),
+              ),
             ),
           ),
         ),
-      ),
-    );
-    expect(find.text('1 项进行中'), findsOneWidget);
-    await tester.tap(find.text('后台活动'));
-    await tester.pump(const Duration(milliseconds: 300));
-    expect(find.textContaining('已拉取 2 页 · 80 条消息'), findsOneWidget);
-    task.finish(
-      state: 'failed',
-      detail: '平台限流',
-      retryAt: DateTime.now().add(const Duration(seconds: 60)),
-    );
-    await tester.pump();
-    expect(find.textContaining('平台限流'), findsOneWidget);
-    expect(find.textContaining('后重试'), findsOneWidget);
-    expect(find.text('0 项进行中 · 1 项需留意'), findsOneWidget);
-    expect(tester.takeException(), isNull);
-    await tester.tap(find.text('关闭'));
-    await tester.pumpAndSettle();
-    expect(find.text('1 项后台活动需要留意'), findsOneWidget);
-  });
+      );
+      expect(find.text('1 项进行中'), findsOneWidget);
+      await tester.tap(find.text('后台活动'));
+      await tester.pump(const Duration(milliseconds: 300));
+      expect(find.textContaining('已拉取 2 页 · 80 条消息'), findsOneWidget);
+      task.finish(
+        state: 'failed',
+        detail: '平台限流',
+        retryAt: DateTime.now().add(const Duration(seconds: 60)),
+      );
+      await tester.pump();
+      expect(find.textContaining('平台限流'), findsNothing);
+      await tester.pump(const Duration(seconds: 5));
+      expect(find.textContaining('平台限流'), findsOneWidget);
+      expect(find.textContaining('后重试'), findsOneWidget);
+      expect(find.text('0 项进行中 · 1 项需留意'), findsOneWidget);
+      await tester.tap(find.text('暂停刷新'));
+      await tester.pump();
+      final next = w.activities.begin('sync', '拉取新消息', '工作账号 · 测试群');
+      next.progress('新一轮进度');
+      await tester.pump(const Duration(seconds: 10));
+      expect(find.textContaining('平台限流'), findsOneWidget);
+      expect(find.textContaining('新一轮进度'), findsNothing);
+      await tester.tap(find.text('立即刷新'));
+      await tester.pump();
+      expect(find.textContaining('新一轮进度'), findsOneWidget);
+      next.progress('后续进度');
+      await tester.pump(const Duration(seconds: 10));
+      expect(find.textContaining('新一轮进度'), findsOneWidget);
+      expect(find.textContaining('后续进度'), findsNothing);
+      await tester.tap(find.text('恢复刷新'));
+      await tester.pump();
+      expect(find.textContaining('后续进度'), findsOneWidget);
+      next.finish(state: 'failed', detail: '平台限流');
+      expect(tester.takeException(), isNull);
+      await tester.tap(find.text('关闭'));
+      await tester.pumpAndSettle();
+      expect(find.text('1 项后台活动需要留意'), findsOneWidget);
+    },
+  );
 }

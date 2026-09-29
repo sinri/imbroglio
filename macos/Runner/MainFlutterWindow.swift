@@ -6,6 +6,7 @@ class MainFlutterWindow: NSWindow {
   private var startupChannel: FlutterMethodChannel?
 
   override func awakeFromNib() {
+    let startupBegan = ProcessInfo.processInfo.systemUptime
     let flutterViewController = FlutterViewController()
     self.contentViewController = flutterViewController
 
@@ -51,7 +52,7 @@ class MainFlutterWindow: NSWindow {
       self?.loadingView = nil
       self?.makeKeyAndOrderFront(nil)
       NSApp.activate(ignoringOtherApps: true)
-      result(nil)
+      result(Int((ProcessInfo.processInfo.systemUptime - startupBegan) * 1_000_000))
     }
 
     RegisterGeneratedPlugins(registry: flutterViewController)

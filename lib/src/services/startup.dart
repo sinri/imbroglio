@@ -8,19 +8,27 @@ Future<void> startWorkspace(
   required Future<void> Function() initializeDesktop,
 }) async {
   try {
-    await showWindow();
+    await workspace.startupTrace.measure('window.show', showWindow);
     await Future<void>.delayed(Duration.zero);
     await workspace.initialize(directory: directory);
   } catch (e) {
     workspace.fatal = '启动失败：$e';
     workspace.changed();
   }
+  workspace.startupTrace.mark(
+    workspace.ready ? 'startup.ready' : 'startup.failed',
+  );
+  await workspace.saveStartupTrace();
   if (workspace.ready) {
     try {
-      await initializeDesktop();
+      await workspace.startupTrace.measure(
+        'desktop.initialize',
+        initializeDesktop,
+      );
     } catch (_) {
       workspace.notice = '桌面通知或托盘初始化失败，可继续使用工作台';
       workspace.changed();
     }
+    await workspace.saveStartupTrace();
   }
 }

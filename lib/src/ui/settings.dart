@@ -11,6 +11,7 @@ import '../core/models.dart';
 import '../core/feishu_auth.dart';
 import '../services/agent.dart';
 import 'app.dart';
+import 'conversation_blacklist.dart';
 
 class PluginsPage extends ConsumerStatefulWidget {
   const PluginsPage({super.key});
@@ -333,6 +334,21 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
           ...w.accounts.map((a) => a.platform),
         })
           accountSource(platform),
+        const SizedBox(height: 30),
+        ListTile(
+          contentPadding: EdgeInsets.zero,
+          title: const Text('会话黑名单'),
+          subtitle: Text(
+            '已配置 ${w.conversationBlacklist.length} 条规则 · 按会话名称排除自动同步',
+          ),
+          trailing: OutlinedButton(
+            onPressed: () => showDialog<void>(
+              context: context,
+              builder: (_) => ConversationBlacklistDialog(workspace: w),
+            ),
+            child: const Text('管理规则'),
+          ),
+        ),
         const SizedBox(height: 30),
         Text('模型服务', style: Theme.of(context).textTheme.headlineSmall),
         const SizedBox(height: 8),
@@ -919,12 +935,12 @@ class _AccountDialogState extends ConsumerState<_AccountDialog> {
     final appScopes = (permissions['appScopes'] as List).cast<String>().toSet();
     final available = {...granted, ...appScopes};
     final canReuse = permissions['canReuse'] == true;
-    if (canReuse &&
-        granted.containsAll({...feishuSendScopes, ...feishuDocumentScopes})) {
+    if (canReuse && granted.containsAll(feishuAllScopes)) {
       return [];
     }
     var sending = granted.containsAll(feishuSendScopes);
     var documents = granted.containsAll(feishuDocumentScopes);
+    var agent = granted.containsAll(feishuAgentScopes);
     Widget scopeDetails(Set<String> scopes) => Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -972,6 +988,7 @@ class _AccountDialogState extends ConsumerState<_AccountDialog> {
                   const Text('在飞书开放平台的用户身份权限中搜索以下标识。'),
                   const SizedBox(height: 8),
                   scopeDetails(feishuReadScopes),
+                  const Text('包含会话和消息读取、图片附件下载、联系人资料查询、消息搜索。'),
                   TextButton.icon(
                     onPressed: () async {
                       await Clipboard.setData(
@@ -1024,6 +1041,32 @@ class _AccountDialogState extends ConsumerState<_AccountDialog> {
                         : (v) => update(() => documents = v!),
                   ),
                   scopeDetails(feishuDocumentScopes),
+                  const Divider(),
+                  CheckboxListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text('Agent 创建文档与待办'),
+                    subtitle: Text(
+                      granted.containsAll(feishuAgentScopes)
+                          ? '已授权；执行具体操作时仍需确认'
+                          : available.containsAll(feishuAgentScopes)
+                          ? '可选，需要用户授权；执行具体操作时仍需确认'
+                          : '应用尚未开通，请先在飞书开放平台开通',
+                    ),
+                    value: agent,
+                    onChanged:
+                        granted.containsAll(feishuAgentScopes) ||
+                            !available.containsAll(feishuAgentScopes)
+                        ? null
+                        : (v) => update(() => agent = v!),
+                  ),
+                  scopeDetails(feishuAgentScopes),
+                  TextButton.icon(
+                    onPressed: () => Clipboard.setData(
+                      ClipboardData(text: feishuAllScopes.join('\n')),
+                    ),
+                    icon: const Icon(Icons.copy, size: 16),
+                    label: const Text('复制全部功能权限'),
+                  ),
                 ],
               ),
             ),
@@ -1038,6 +1081,12 @@ class _AccountDialogState extends ConsumerState<_AccountDialog> {
                 onPressed: () => Navigator.pop(dialogContext, <String>[]),
                 child: const Text('使用现有授权连接'),
               ),
+            TextButton(
+              onPressed: available.containsAll(feishuAllScopes)
+                  ? () => Navigator.pop(dialogContext, feishuAllScopes.toList())
+                  : null,
+              child: const Text('一次性授权全部功能'),
+            ),
             FilledButton(
               onPressed: !available.containsAll(feishuReadScopes)
                   ? null
@@ -1045,6 +1094,7 @@ class _AccountDialogState extends ConsumerState<_AccountDialog> {
                       ...feishuReadScopes,
                       if (sending) ...feishuSendScopes,
                       if (documents) ...feishuDocumentScopes,
+                      if (agent) ...feishuAgentScopes,
                     ]),
               child: Text(canReuse ? '授权所选功能' : '授权并连接'),
             ),

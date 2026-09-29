@@ -6,9 +6,19 @@ const feishuReadScopes = {
   'im:message.group_msg:get_as_user',
   'im:message.p2p_msg:get_as_user',
   'im:message.reactions:read',
+  'im:message:readonly',
+  'contact:user:search',
+  'search:message',
 };
 const feishuSendScopes = {'im:message.send_as_user', 'im:message'};
 const feishuDocumentScopes = {'docx:document:readonly', 'search:docs:read'};
+const feishuAgentScopes = {'docx:document:create', 'task:task:write'};
+const feishuAllScopes = {
+  ...feishuReadScopes,
+  ...feishuSendScopes,
+  ...feishuDocumentScopes,
+  ...feishuAgentScopes,
+};
 
 Set<String> feishuScopes(Json user) => '${user['scope'] ?? ''}'
     .split(RegExp(r'\s+'))

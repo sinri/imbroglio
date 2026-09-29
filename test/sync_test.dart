@@ -80,6 +80,178 @@ void main() {
     temporaryDirectories.clear();
   });
   test(
+    'three tiers cool idle chats and revisit them after three hours',
+    () async {
+      final now = DateTime.now();
+      w.conversations = [
+        conversation.copyWith(
+          updatedAt: now
+              .subtract(const Duration(hours: 2))
+              .millisecondsSinceEpoch,
+        ),
+        const Conversation(
+          accountId: 'a',
+          id: 'hot',
+          title: 'hot',
+        ).copyWith(updatedAt: now.millisecondsSinceEpoch),
+      ];
+      final reads = <String, int>{};
+      w.clients['a'] = FakeRpc((method, args) {
+        if (method == 'messages' && args['before'] == null) {
+          final id = object(args['conversation'])['id'] as String;
+          reads[id] = (reads[id] ?? 0) + 1;
+        }
+        return {'items': [], 'hasMore': false, 'complete': true};
+      });
+      Future<void> tick(int seconds) async {
+        w.tick(at: now.add(Duration(seconds: seconds)));
+        await Future<void>.delayed(const Duration(milliseconds: 60));
+      }
+
+      await tick(0);
+      await tick(1);
+      expect(reads, {'c': 1, 'hot': 1});
+      await tick(31);
+      expect(reads, {'c': 1, 'hot': 2});
+      await tick(3601);
+      expect(reads, {'c': 1, 'hot': 2});
+      await tick(10801);
+      await tick(10802);
+      expect(reads, {'c': 2, 'hot': 3});
+    },
+  );
+
+  test(
+    'active discovery resumes a fixed window and preserves rich chat details',
+    () async {
+      final now = DateTime.now();
+      w.conversations = [
+        const Conversation(
+          accountId: 'a',
+          id: 'c',
+          title: 'Known',
+          peerId: 'peer',
+          avatar: 'avatar',
+        ),
+      ];
+      final queries = <Json>[];
+      var fail = false;
+      w.clients['a'] = FakeRpc((method, args) {
+        queries.add({...args});
+        if (fail) throw const AppFailure('network', 'offline');
+        return {
+          'items': [
+            conversation
+                .copyWith(updatedAt: now.millisecondsSinceEpoch)
+                .toJson(),
+          ],
+          'complete': args['cursor'] == 'page2',
+          'cursor': args['cursor'] == 'page2' ? '' : 'page2',
+        };
+      });
+      await w.refreshActiveConversations(account, at: now);
+      expect(
+        (await w.store.get('activeDiscovery', 'a'))?['completedUntil'],
+        isNull,
+      );
+      fail = true;
+      await expectLater(
+        w.refreshActiveConversations(
+          account,
+          at: now.add(const Duration(seconds: 15)),
+        ),
+        throwsA(isA<AppFailure>()),
+      );
+      fail = false;
+      await w.refreshActiveConversations(
+        account,
+        at: now.add(const Duration(seconds: 30)),
+      );
+      expect(queries.last['start'], queries.first['start']);
+      expect(queries.last['end'], queries.first['end']);
+      expect(queries.last['cursor'], 'page2');
+      expect(
+        (await w.store.get('activeDiscovery', 'a'))?['completedUntil'],
+        queries.first['end'],
+      );
+      expect(w.conversations.single.title, 'Known');
+      expect(w.conversations.single.peerId, 'peer');
+      expect(w.conversations.single.avatar, 'avatar');
+      await w.refreshActiveConversations(
+        account,
+        at: now.add(const Duration(seconds: 45)),
+      );
+      expect(queries.last['start'], (queries.first['end'] as int) - 120000);
+    },
+  );
+
+  test(
+    'active discovery rejects a stalled page without advancing checkpoint',
+    () async {
+      w.clients['a'] = FakeRpc(
+        (_, _) => {'items': [], 'complete': false, 'cursor': ''},
+      );
+      await expectLater(
+        w.refreshActiveConversations(account),
+        throwsA(isA<AppFailure>()),
+      );
+      expect(
+        (await w.store.get('activeDiscovery', 'a'))?['completedUntil'],
+        isNull,
+      );
+    },
+  );
+
+  test(
+    'active changes wake cold chats without repeating overlapping results',
+    () async {
+      final now = DateTime.now();
+      w.conversations = [
+        conversation.copyWith(
+          updatedAt: now
+              .subtract(const Duration(hours: 2))
+              .millisecondsSinceEpoch,
+        ),
+      ];
+      var latest = now
+          .subtract(const Duration(hours: 2))
+          .millisecondsSinceEpoch;
+      var reads = 0;
+      w.clients['a'] = FakeRpc((method, args) {
+        if (method == 'conversations.active') {
+          return {
+            'items': [conversation.copyWith(updatedAt: latest).toJson()],
+            'complete': true,
+          };
+        }
+        if (method == 'messages' && args['before'] == null) reads++;
+        return {'items': [], 'hasMore': false, 'complete': true};
+      });
+      Future<void> tick(int seconds) async {
+        w.tick(at: now.add(Duration(seconds: seconds)));
+        await Future<void>.delayed(const Duration(milliseconds: 60));
+      }
+
+      await tick(0);
+      await tick(1);
+      expect(reads, 1);
+      latest = now.millisecondsSinceEpoch;
+      await w.refreshActiveConversations(
+        account,
+        at: now.add(const Duration(seconds: 2)),
+      );
+      await tick(3);
+      expect(reads, 2);
+      await w.refreshActiveConversations(
+        account,
+        at: now.add(const Duration(seconds: 4)),
+      );
+      await tick(5);
+      expect(reads, 2);
+    },
+  );
+
+  test(
     'partial login continues verification and preserves a visible permissions warning',
     () async {
       final calls = <String>[];
@@ -659,6 +831,132 @@ void main() {
     },
   );
 
+  for (final blockedPlatform in ['dingtalk', 'feishu']) {
+    test('$blockedPlatform discovery cannot starve another plugin', () async {
+      final otherPlatform = blockedPlatform == 'dingtalk'
+          ? 'feishu'
+          : 'dingtalk';
+      final blocked = Completer<Json>();
+      final discovered = Completer<void>();
+      final messages = Completer<void>();
+      final blockedCalls = <String>{};
+      w.accounts = [
+        for (var i = 0; i < 4; i++)
+          AccountRef(
+            id: 'blocked$i',
+            platform: blockedPlatform,
+            label: 'blocked',
+          ),
+        AccountRef(id: 'a', platform: otherPlatform, label: 'other'),
+      ];
+      for (final a in w.accounts.take(4)) {
+        w.clients[a.id] = FakeRpc((method, _) {
+          blockedCalls.add(a.id);
+          return blocked.future;
+        });
+      }
+      w.clients['a'] = FakeRpc((method, _) {
+        if (method == 'conversations' && !discovered.isCompleted) {
+          discovered.complete();
+        }
+        if (method == 'messages' && !messages.isCompleted) messages.complete();
+        return {'items': [], 'hasMore': false};
+      });
+      try {
+        w.tick();
+        await Future.wait([
+          discovered.future,
+          messages.future,
+        ]).timeout(const Duration(seconds: 2));
+        expect(blockedCalls.length, 4);
+        expect(blocked.isCompleted, false);
+      } finally {
+        blocked.complete({'items': [], 'hasMore': false});
+      }
+    });
+  }
+
+  test('saturated message slots do not block another plugin', () async {
+    final blocked = Completer<Json>();
+    final entered = Completer<void>();
+    final otherMessages = Completer<void>();
+    w.accounts = [
+      const AccountRef(id: 'ding', platform: 'dingtalk', label: 'DingTalk'),
+      account,
+    ];
+    final chats = List.generate(
+      3,
+      (i) => Conversation(accountId: 'ding', id: 'chat$i', title: 'Chat $i'),
+    );
+    w.conversations = [...chats, conversation];
+    var calls = 0;
+    w.clients['ding'] = FakeRpc((method, _) {
+      if (method == 'messages' && ++calls == 3) entered.complete();
+      return blocked.future;
+    });
+    w.clients['a'] = FakeRpc((method, _) {
+      if (method == 'messages' && !otherMessages.isCompleted) {
+        otherMessages.complete();
+      }
+      return {'items': [], 'hasMore': false};
+    });
+    final pending = chats.map((c) => w.syncConversation(c)).toList();
+    try {
+      await entered.future.timeout(const Duration(seconds: 2));
+      w.tick();
+      w.tick();
+      await otherMessages.future.timeout(const Duration(seconds: 2));
+      expect(calls, 3);
+      expect(blocked.isCompleted, false);
+    } finally {
+      blocked.complete({'items': [], 'hasMore': false});
+      await Future.wait(pending);
+    }
+  });
+
+  test('history pages run independently across plugins', () async {
+    final blocked = Completer<Json>();
+    final historyCalls = <String>[];
+    final bothStarted = Completer<void>();
+    final now = DateTime.now();
+    w.accounts = [
+      const AccountRef(id: 'ding', platform: 'dingtalk', label: 'DingTalk'),
+      account,
+    ];
+    w.conversations = [
+      const Conversation(accountId: 'ding', id: 'c', title: 'DingTalk chat'),
+      conversation,
+    ];
+    for (final c in w.conversations) {
+      await w.store.put('cursors', c.key, {
+        'timestamp': now.millisecondsSinceEpoch,
+      });
+      w.clients[c.accountId] = FakeRpc((method, args) {
+        if (method == 'messages' && !args.containsKey('since')) {
+          historyCalls.add(c.accountId);
+          if (historyCalls.length == 2) bothStarted.complete();
+          return blocked.future;
+        }
+        return {'items': [], 'hasMore': false};
+      });
+    }
+    try {
+      w.tick(at: now);
+      // Let live requests finish before the next scheduler tick requests history.
+      while (w.activities.runningCount > 0) {
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+      }
+      w.tick(at: now.add(const Duration(seconds: 1)));
+      await bothStarted.future.timeout(const Duration(seconds: 2));
+      w.tick(at: now.add(const Duration(seconds: 2)));
+      expect(historyCalls, containsAll(['ding', 'a']));
+      expect(historyCalls.length, 2);
+      expect(blocked.isCompleted, false);
+    } finally {
+      blocked.complete({'items': [], 'hasMore': false});
+    }
+  });
+
   test(
     '100 recent chats receive a sync slot within 60 scheduler ticks',
     () async {
@@ -762,6 +1060,76 @@ void main() {
       expect(
         (await w.store.get('cursors', conversation.key))!['timestamp'],
         5000,
+      );
+    },
+  );
+
+  for (final found in [true, false]) {
+    test(
+      'successful Feishu lookup caches missing avatar, found=$found',
+      () async {
+        var calls = 0;
+        w.clients['a'] = FakeRpc((method, args) {
+          calls++;
+          return {
+            'items': [
+              if (found) {'id': 'u', 'name': 'User', 'avatar': ''},
+            ],
+          };
+        });
+        const m = Message(
+          accountId: 'a',
+          conversationId: 'c',
+          id: 'm',
+          senderId: 'u',
+          text: '',
+          timestamp: 1,
+        );
+        await w.resolveSenders('a', [m]);
+        final key = compositeKey('a', 'u');
+        final saved = (await w.store.get('senders', key))!;
+        expect(saved['avatarUnavailable'], true);
+        expect(
+          saved['expires'] as int,
+          greaterThan(
+            DateTime.now()
+                .add(const Duration(hours: 11))
+                .millisecondsSinceEpoch,
+          ),
+        );
+        w.senderProfiles.clear();
+        await w.resolveSenders('a', [m]);
+        expect(calls, 1);
+        w.senderProfiles.clear();
+        await w.store.put('senders', key, {...saved, 'expires': 0});
+        await w.resolveSenders('a', [m]);
+        expect(calls, 2);
+      },
+    );
+  }
+
+  test(
+    'failed profile query does not cache absent avatar for twelve hours',
+    () async {
+      w.clients['a'] = FakeRpc(
+        (_, _) => throw const AppFailure('timeout', 'retry'),
+      );
+      const m = Message(
+        accountId: 'a',
+        conversationId: 'c',
+        id: 'm',
+        senderId: 'u',
+        text: '',
+        timestamp: 1,
+      );
+      await w.resolveSenders('a', [m]);
+      final saved = (await w.store.get('senders', compositeKey('a', 'u')))!;
+      expect(saved['avatarUnavailable'], isNull);
+      expect(
+        saved['expires'] as int,
+        lessThan(
+          DateTime.now().add(const Duration(minutes: 1)).millisecondsSinceEpoch,
+        ),
       );
     },
   );

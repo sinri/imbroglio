@@ -236,27 +236,33 @@ class _WrappingCodeBlock extends MarkdownElementBuilder {
 
 class SenderAvatar extends StatelessWidget {
   final String name, url, path;
+  final double radius;
+  final IconData? fallbackIcon;
   const SenderAvatar({
     super.key,
     required this.name,
     required this.url,
     this.path = '',
+    this.radius = 16,
+    this.fallbackIcon,
   });
   @override
   Widget build(BuildContext context) {
     final fallback = CircleAvatar(
-      radius: 16,
-      child: Text(
-        name.isEmpty ? '?' : String.fromCharCode(name.runes.first),
-        style: const TextStyle(fontSize: 12),
-      ),
+      radius: radius,
+      child: fallbackIcon != null
+          ? Icon(fallbackIcon)
+          : Text(
+              name.isEmpty ? '?' : String.fromCharCode(name.runes.first),
+              style: const TextStyle(fontSize: 12),
+            ),
     );
     if (path.isNotEmpty) {
       return ClipOval(
         child: Image.file(
           File(path),
-          width: 32,
-          height: 32,
+          width: radius * 2,
+          height: radius * 2,
           fit: BoxFit.cover,
           errorBuilder: (_, _, _) => fallback,
         ),
@@ -266,8 +272,8 @@ class SenderAvatar extends StatelessWidget {
     return ClipOval(
       child: Image.network(
         url,
-        width: 32,
-        height: 32,
+        width: radius * 2,
+        height: radius * 2,
         fit: BoxFit.cover,
         errorBuilder: (_, _, _) => fallback,
       ),

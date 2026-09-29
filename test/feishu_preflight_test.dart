@@ -58,6 +58,50 @@ void main() {
   });
   tearDown(() => w.close());
 
+  test(
+    'legacy message-only grant must add contact and search scopes',
+    () async {
+      user['scope'] = feishuReadScopes
+          .difference({'contact:user:search', 'search:message'})
+          .join(' ');
+      await w.authenticate(account);
+      expect(calls, contains('auth.login'));
+      expect(requested, containsAll(['contact:user:search', 'search:message']));
+    },
+  );
+
+  test(
+    'all feature scopes are requested in one login preserving grants',
+    () async {
+      enabled.addAll(feishuAllScopes);
+      user['scope'] = '${user['scope']} offline_access';
+      await w.authenticate(
+        account,
+        onPermissions: (_) async => feishuAllScopes.toList(),
+      );
+      expect(calls.where((method) => method == 'auth.login').length, 1);
+      expect(requested.toSet(), {...feishuAllScopes, 'offline_access'});
+    },
+  );
+
+  test('missing app permissions are named before login', () async {
+    enabled.remove('contact:user:search');
+    user['scope'] = feishuReadScopes
+        .difference({'contact:user:search'})
+        .join(' ');
+    await expectLater(
+      w.authenticate(account),
+      throwsA(
+        isA<AppFailure>().having(
+          (e) => e.message,
+          'missing scope',
+          contains('contact:user:search'),
+        ),
+      ),
+    );
+    expect(calls, isNot(contains('auth.login')));
+  });
+
   test('valid basic authorization reuses identity without login', () async {
     final result = await w.authenticate(account);
     expect(calls, ['auth.status', 'auth.scopes']);

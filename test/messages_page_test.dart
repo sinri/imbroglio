@@ -236,6 +236,92 @@ void main() {
   });
 
   test(
+    'Feishu avatars survive caching and match sender identity across chats',
+    () {
+      final normalized = normalizeConversation('a', {
+        'chat_id': 'private',
+        'name': 'Peer',
+        'chat_mode': 'p2p',
+        'p2p_target_id': 'ou_peer',
+        'avatar': 'https://example.com/peer.png',
+      });
+      final cached = Conversation.fromJson(
+        normalized.copyWith(unread: 1).toJson(),
+      );
+      expect(cached.kind, 'p2p');
+      expect(cached.peerId, 'ou_peer');
+      expect(cached.avatar, 'https://example.com/peer.png');
+      w.conversations.add(cached);
+      Message message(String sender, {Json extra = const {}}) => Message(
+        accountId: 'a',
+        conversationId: 'c',
+        id: 'm',
+        text: '',
+        timestamp: 0,
+        senderId: sender,
+        extra: extra,
+      );
+      expect(senderAvatar(w, message('ou_peer')), cached.avatar);
+      expect(senderAvatar(w, message('ou_other')), isEmpty);
+      expect(
+        senderAvatar(w, message('ou_peer', extra: {'isOwn': true})),
+        isEmpty,
+      );
+      expect(
+        senderAvatar(
+          w,
+          message(
+            'ou_peer',
+            extra: {'avatar': 'https://example.com/message.png'},
+          ),
+        ),
+        'https://example.com/message.png',
+      );
+      w.conversations = [
+        Conversation(
+          accountId: 'other',
+          id: 'private',
+          title: '',
+          kind: 'p2p',
+          peerId: 'ou_peer',
+          avatar: cached.avatar,
+        ),
+        Conversation(
+          accountId: 'a',
+          id: 'group',
+          title: '',
+          peerId: 'ou_peer',
+          avatar: cached.avatar,
+        ),
+      ];
+      expect(senderAvatar(w, message('ou_peer')), isEmpty);
+    },
+  );
+
+  testWidgets(
+    'conversation list uses platform avatar and falls back on image failure',
+    (tester) async {
+      w.conversations = [
+        const Conversation(
+          accountId: 'a',
+          id: 'c',
+          title: '测试群',
+          kind: 'p2p',
+          avatar: 'https://example.com/chat.png',
+        ),
+      ];
+      await open(tester);
+      final avatar = tester.widget<SenderAvatar>(
+        find.byType(SenderAvatar).first,
+      );
+      expect(avatar.url, 'https://example.com/chat.png');
+      await tester.pumpAndSettle();
+      expect(find.text('测'), findsOneWidget);
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  test(
     'old DingTalk cache displays sender label and keeps message avatar when profile is empty',
     () {
       const m = Message(

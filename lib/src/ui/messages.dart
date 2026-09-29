@@ -31,13 +31,21 @@ String senderName(Workspace w, Message m) {
 }
 
 String senderAvatar(Workspace w, Message m) {
+  final embedded = messageSenderAvatar(m);
+  if (embedded.isNotEmpty) return embedded;
+  final fromChat = conversationSenderAvatar(m, w.conversations);
+  if (fromChat.isNotEmpty) return fromChat;
   final profile =
       w.senderProfiles[compositeKey(m.accountId, senderLookupId(m))];
   final resolved = avatarUrl(profile?['avatar']);
-  return resolved.isNotEmpty ? resolved : messageSenderAvatar(m);
+  return resolved;
 }
 
 String senderAvatarPath(Workspace w, Message m) {
+  if (messageSenderAvatar(m).isNotEmpty ||
+      conversationSenderAvatar(m, w.conversations).isNotEmpty) {
+    return '';
+  }
   final profile =
       w.senderProfiles[compositeKey(m.accountId, senderLookupId(m))];
   final path = '${profile?['avatarPath'] ?? ''}';
@@ -246,14 +254,13 @@ class _MessagesPageState extends ConsumerState<MessagesPage> {
                               selected: c?.key == chat.key,
                               selectedTileColor: scheme.primaryContainer
                                   .withValues(alpha: .5),
-                              leading: CircleAvatar(
-                                backgroundColor: scheme.secondaryContainer,
-                                child: Icon(
-                                  chat.kind == 'group'
-                                      ? Icons.group_outlined
-                                      : Icons.person_outline,
-                                  size: 22,
-                                ),
+                              leading: SenderAvatar(
+                                name: chat.title,
+                                url: chat.avatar,
+                                radius: 20,
+                                fallbackIcon: chat.kind == 'group'
+                                    ? Icons.group_outlined
+                                    : null,
                               ),
                               title: Text(
                                 chat.title,
@@ -265,7 +272,11 @@ class _MessagesPageState extends ConsumerState<MessagesPage> {
                                 ),
                               ),
                               subtitle: Text(
-                                '${w.account(chat.accountId).platform == 'dingtalk' ? '钉钉' : '飞书'} · ${chat.watched ? '已关注' : timeLabel(chat.updatedAt)}',
+                                '${w.account(chat.accountId).platform == 'dingtalk' ? '钉钉' : '飞书'} · ${w.isConversationExcluded(chat)
+                                    ? '已排除自动同步'
+                                    : chat.watched
+                                    ? '已关注'
+                                    : timeLabel(chat.updatedAt)}',
                                 style: const TextStyle(fontSize: 11),
                               ),
                               trailing: chat.unread > 0
@@ -339,12 +350,20 @@ class _MessagesPageState extends ConsumerState<MessagesPage> {
                                 ),
                                 const SizedBox(height: 4),
                                 Text(
-                                  '${w.account(c.accountId).label} · 用户身份 · ${state?.mode ?? '定时同步'} · ${(state?.lastSuccess ?? 0) == 0 ? '尚未同步' : '最近同步 ${timeLabel(state!.lastSuccess)}'}',
+                                  '${w.account(c.accountId).label} · 用户身份 · ${w.isConversationExcluded(c) ? '已排除自动同步' : state?.mode ?? '定时同步'} · ${(state?.lastSuccess ?? 0) == 0 ? '尚未同步' : '最近同步 ${timeLabel(state!.lastSuccess)}'}',
                                   style: Theme.of(context).textTheme.bodySmall,
                                 ),
                               ],
                             ),
                           ),
+                          if (w.isConversationExcluded(c))
+                            TextButton(
+                              onPressed: () => guarded(
+                                context,
+                                () => w.syncConversation(c, manual: true),
+                              ),
+                              child: const Text('手动拉取'),
+                            ),
                           IconButton(
                             tooltip: '切换关注',
                             onPressed: () => guarded(

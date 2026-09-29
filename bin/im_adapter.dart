@@ -384,6 +384,94 @@ class Adapter {
           raw: true,
         );
         return {};
+      case 'conversations.active':
+        // Both activity APIs require whole-second ISO timestamps. Feishu
+        // forwards fractional seconds unchanged and rejects even ".000Z".
+        String activityTime(int millis) => DateTime.fromMillisecondsSinceEpoch(
+          millis ~/ 1000 * 1000,
+          isUtc: true,
+        ).toIso8601String().replaceFirst('.000Z', 'Z');
+        final start = activityTime(args['start'] as int);
+        final end = activityTime(args['end'] as int);
+        final cursor = '${args['cursor'] ?? ''}';
+        final envelope = object(
+          jsonDecode(
+            await run(
+                  id,
+                  platform == 'dingtalk'
+                      ? scoped([
+                          'chat',
+                          '+recent-conversations',
+                          '--start',
+                          start,
+                          '--end',
+                          end,
+                          '--page-limit',
+                          '1',
+                          '--total-timeout',
+                          '30',
+                          if (cursor.isNotEmpty) ...['--cursor', cursor],
+                        ])
+                      : scoped([
+                          'im',
+                          '+messages-search',
+                          '--start',
+                          start,
+                          '--end',
+                          end,
+                          '--no-reactions',
+                          '--page-size',
+                          '50',
+                          if (cursor.isNotEmpty) ...['--page-token', cursor],
+                        ], user: true),
+                  raw: true,
+                )
+                as String,
+          ),
+        );
+        final data = object(unwrap(envelope));
+        final pagination = object(object(envelope['meta'])['pagination']);
+        final next = platform == 'dingtalk'
+            ? '${pagination['next_token'] ?? ''}'
+            : '${data['page_token'] ?? ''}';
+        final complete = platform == 'dingtalk'
+            ? data['complete'] == true ||
+                  pagination['endpoint_exhausted'] == true
+            : data['has_more'] == false;
+        if (!complete && (next.isEmpty || next == cursor)) {
+          throw const AppFailure('contract', '活跃会话分页无法继续，检查点未推进');
+        }
+        final active = <String, Conversation>{};
+        for (final row in rows(data)) {
+          final chat = platform == 'dingtalk'
+              ? normalizeConversation(accountId, {
+                  'conversationId': row['conversationId'],
+                  'name': row['name'],
+                  'kind': row['type'] == 'direct'
+                      ? 'p2p'
+                      : row['type'] == 'group'
+                      ? 'group'
+                      : 'unknown',
+                  'lastMessageTime': row['latestMessageTime'],
+                })
+              : normalizeConversation(accountId, {
+                  'chat_id': row['chat_id'],
+                  'name': row['chat_name'],
+                  'chat_type': row['chat_type'],
+                  'last_message_time': row['create_time'],
+                });
+          if (chat.updatedAt <= 0) {
+            throw const AppFailure('contract', '活跃会话缺少消息时间，检查点未推进');
+          }
+          if (chat.updatedAt > (active[chat.id]?.updatedAt ?? 0)) {
+            active[chat.id] = chat;
+          }
+        }
+        return {
+          'items': active.values.map((c) => c.toJson()).toList(),
+          'cursor': next,
+          'complete': complete,
+        };
       case 'conversations':
         final value = await run(
           id,

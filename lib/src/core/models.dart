@@ -75,7 +75,7 @@ class AccountRef {
 }
 
 class Conversation {
-  final String accountId, id, title, kind, peerId;
+  final String accountId, id, title, kind, peerId, avatar;
   final int updatedAt, unread;
   final bool watched, unreadIsLocal;
   const Conversation({
@@ -84,6 +84,7 @@ class Conversation {
     required this.title,
     this.kind = 'group',
     this.peerId = '',
+    this.avatar = '',
     this.updatedAt = 0,
     this.unread = 0,
     this.watched = false,
@@ -96,6 +97,7 @@ class Conversation {
     title: j['title'],
     kind: j['kind'] ?? 'group',
     peerId: j['peerId'] ?? '',
+    avatar: j['avatar'] ?? '',
     updatedAt: j['updatedAt'] ?? 0,
     unread: j['unread'] ?? 0,
     watched: j['watched'] ?? false,
@@ -107,6 +109,7 @@ class Conversation {
     'title': title,
     'kind': kind,
     'peerId': peerId,
+    'avatar': avatar,
     'updatedAt': updatedAt,
     'unread': unread,
     'watched': watched,
@@ -123,6 +126,7 @@ class Conversation {
     title: title,
     kind: kind,
     peerId: peerId,
+    avatar: avatar,
     watched: watched ?? this.watched,
     unreadIsLocal: unreadIsLocal ?? this.unreadIsLocal,
     unread: unread ?? this.unread,

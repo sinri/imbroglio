@@ -7,6 +7,8 @@ import 'package:flutter/services.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import '../core/models.dart';
+import '../core/startup_trace.dart';
+import '../core/conversation_blacklist.dart';
 import '../core/feishu_auth.dart';
 import '../core/normalize.dart';
 import '../core/rpc.dart';
@@ -16,6 +18,13 @@ import 'store.dart';
 import 'activity.dart';
 
 class Workspace extends ChangeNotifier {
+  final startupTrace = StartupTrace();
+  String? _startupTracePath;
+  Future<void> saveStartupTrace() async {
+    final path = _startupTracePath;
+    if (path != null) await startupTrace.save(path);
+  }
+
   late final activities = ActivityLog(changed);
   late Store store;
   late PluginManager plugins;
@@ -34,6 +43,7 @@ class Workspace extends ChangeNotifier {
 
   String startupStatus = '正在准备工作区…';
   void startupProgress(String message) {
+    startupTrace.mark(message);
     startupStatus = message;
     changed();
   }
@@ -64,6 +74,7 @@ class Workspace extends ChangeNotifier {
   final _busy = <String>{}, _updating = <String>{};
   final _backoff = <String, DateTime>{};
   final _next = <String, DateTime>{};
+  final _pendingChecks = <String>{};
   final _streams = <String>{};
   final blockedConversations = <String>{};
   final diagnostics = <Json>[];
@@ -105,7 +116,55 @@ class Workspace extends ChangeNotifier {
     changed();
   }
 
+  List<ConversationBlacklistRule> _conversationBlacklist = [];
+  List<ConversationBlacklistRule> get conversationBlacklist =>
+      List.unmodifiable(_conversationBlacklist);
+
+  bool isConversationExcluded(Conversation c) {
+    final current = conversations.where((v) => v.key == c.key).firstOrNull ?? c;
+    return _conversationBlacklist.any((rule) => rule.matches(current));
+  }
+
+  bool _excludedKey(String accountId, String conversationId) {
+    final c = conversations
+        .where((c) => c.accountId == accountId && c.id == conversationId)
+        .firstOrNull;
+    return c != null && isConversationExcluded(c);
+  }
+
+  Future<void> saveConversationBlacklist(
+    List<ConversationBlacklistRule> rules,
+  ) async {
+    final snapshot = List<ConversationBlacklistRule>.of(rules);
+    await store.put('settings', 'conversationBlacklist', {
+      'rules': snapshot.map((r) => r.toJson()).toList(),
+    });
+    _conversationBlacklist = snapshot;
+    _next.clear();
+    changed();
+    await _stopExcludedSubscriptions();
+  }
+
+  Future<void> _stopExcludedSubscriptions() async {
+    for (final c in conversations.toList()) {
+      if (!isConversationExcluded(c) || !_streams.contains(c.key)) continue;
+      try {
+        await clients[c.accountId]?.call('unsubscribe', {
+          'conversationId': c.id,
+        });
+        _streams.remove(c.key);
+      } catch (e) {
+        notice = '停止会话订阅失败：${c.title}：$e';
+        changed();
+      }
+    }
+  }
+
   Future<void> loadSyncPolicies() async {
+    final blacklist = await store.get('settings', 'conversationBlacklist');
+    _conversationBlacklist = (blacklist?['rules'] as List? ?? [])
+        .map((r) => ConversationBlacklistRule.fromJson(object(r)))
+        .toList();
     diagnostics
       ..clear()
       ..addAll(await store.list('diagnostics', limit: 200));
@@ -220,8 +279,12 @@ class Workspace extends ChangeNotifier {
       } catch (_) {
         throw const AppFailure('already_running', '此工作区已有应用运行，请切换到已打开的窗口');
       }
+      _startupTracePath = p.join(root, 'startup-timing.json');
       startupProgress('正在打开消息数据库…');
-      store = await Store.open(p.join(root, 'imbroglio.sqlite'));
+      store = await startupTrace.measure(
+        'database.open',
+        () => Store.open(p.join(root, 'imbroglio.sqlite'), trace: startupTrace),
+      );
       plugins = PluginManager(
         root,
         store,
@@ -234,13 +297,17 @@ class Workspace extends ChangeNotifier {
       conversations = (await store.list(
         'conversations',
       )).map(Conversation.fromJson).toList();
+      final keys = conversations.map((c) => c.key).toList();
+      final reads = await store.getMany('readState', keys);
+      final cursors = await store.getMany('cursors', keys);
       for (final c in conversations) {
-        final read = await store.get('readState', c.key);
+        final read = reads[c.key];
         _readAt[c.key] = read?['timestamp'] as int? ?? 0;
         _seenPlatformTime[c.key] = read?['platformTime'] as int? ?? -1;
-        final cursor = await store.get('cursors', c.key);
+        final cursor = cursors[c.key];
         if (cursor?['historyDone'] == true) _historyDone.add(c.key);
       }
+      startupTrace.mark('conversation-state.loaded');
       await loadSyncPolicies();
       startupProgress('正在载入插件与偏好设置…');
       final seeded = await store.get('settings', 'seeded');
@@ -257,10 +324,13 @@ class Workspace extends ChangeNotifier {
           });
         }
       }
-      await store.put('settings', 'seeded', {'version': 1});
+      if (seeded == null) {
+        await store.put('settings', 'seeded', {'version': 1});
+      }
       packages = await store.list('packages');
       selectedAccount = visibleAccounts.firstOrNull?.id;
       outbox = await store.list('outbox');
+      startupTrace.mark('workspace.ready');
       ready = true;
       _timer = Timer.periodic(const Duration(seconds: 1), (_) => tick());
       changed();
@@ -390,6 +460,7 @@ class Workspace extends ChangeNotifier {
           if (m.accountId != a.id) {
             throw const AppFailure('identity', '插件消息账号不匹配');
           }
+          if (_excludedKey(m.accountId, m.conversationId)) return;
           final isNew = await store.saveIncoming(m);
           if (isNew) {
             await _incrementUnread(m);
@@ -411,7 +482,10 @@ class Workspace extends ChangeNotifier {
         }
       case 'sync.ready':
         final key = compositeKey(a.id, '${params['conversationId']}');
-        if (blockedConversations.contains(key)) return;
+        if (blockedConversations.contains(key) ||
+            _excludedKey(a.id, '${params['conversationId']}')) {
+          return;
+        }
         final wasRetrying = _subscriptionFailures.remove(key) != null;
         _subscriptionRetry.remove(key);
         if (wasRetrying) {
@@ -424,7 +498,10 @@ class Workspace extends ChangeNotifier {
         changed();
       case 'sync.gap':
         final key = compositeKey(a.id, '${params['conversationId']}');
-        if (blockedConversations.contains(key)) return;
+        if (blockedConversations.contains(key) ||
+            _excludedKey(a.id, '${params['conversationId']}')) {
+          return;
+        }
         if (params['disconnected'] == true) {
           _streams.remove(key);
           await _subscriptionFailed(
@@ -562,7 +639,11 @@ class Workspace extends ChangeNotifier {
         final requested = {...granted, ...feishuReadScopes, ...selected};
         final unavailable = requested.difference(appScopes).difference(granted);
         if (unavailable.isNotEmpty) {
-          throw const AppFailure('permission', '应用尚未开通所选功能的权限，请先在飞书开放平台开通后重试');
+          throw AppFailure(
+            'permission',
+            '应用尚未开通所选功能的权限：${(unavailable.toList()..sort()).join('、')}。'
+                '请先在飞书开放平台开通后重试',
+          );
         }
         loginArgs = {'scopes': requested.toList()..sort()};
       }
@@ -736,6 +817,9 @@ class Workspace extends ChangeNotifier {
           }
         }
       }
+      await saveConversationBlacklist(
+        _conversationBlacklist.where((r) => r.accountId != a.id).toList(),
+      );
       await store.deleteAccount(a.id);
       deletedAccountIds.add(a.id);
       final keys = conversations
@@ -775,7 +859,12 @@ class Workspace extends ChangeNotifier {
       ]) {
         map.removeWhere((key, _) => ownedKey(key));
       }
-      for (final set in [_streams, blockedConversations, _historyDone]) {
+      for (final set in [
+        _streams,
+        blockedConversations,
+        _historyDone,
+        _pendingChecks,
+      ]) {
         set.removeWhere(ownedKey);
       }
       _senderQueue.remove(a.id);
@@ -815,6 +904,84 @@ class Workspace extends ChangeNotifier {
     }
   }
 
+  Future<void> refreshActiveConversations(
+    AccountRef a, {
+    DateTime? at,
+  }) => activities.run('active:${a.id}', '发现最新活跃会话', a.label, (_) async {
+    final now = at ?? DateTime.now();
+    final end = now.millisecondsSinceEpoch ~/ 1000 * 1000;
+    final saved =
+        await store.get('activeDiscovery', a.id) ?? <String, dynamic>{};
+    final cursor = '${saved['cursor'] ?? ''}';
+    final state = cursor.isNotEmpty
+        ? saved
+        : <String, dynamic>{
+            'start':
+                ((saved['completedUntil'] as int? ??
+                    end - const Duration(hours: 1).inMilliseconds) -
+                const Duration(minutes: 2).inMilliseconds),
+            'end': end,
+            'completedUntil': saved['completedUntil'],
+          };
+    await store.put('activeDiscovery', a.id, state, account: a.id);
+    final result = object(
+      await (await client(a)).call('conversations.active', {
+        'start': state['start'],
+        'end': state['end'],
+        if (cursor.isNotEmpty) 'cursor': cursor,
+      }),
+    );
+    if (result['items'] is! List || result['complete'] is! bool) {
+      throw const AppFailure('contract', '活跃会话响应不完整，检查点未推进');
+    }
+    final next = '${result['cursor'] ?? ''}';
+    final complete = result['complete'] == true;
+    if (!complete && (next.isEmpty || next == cursor)) {
+      throw const AppFailure('contract', '活跃会话分页无法继续，检查点未推进');
+    }
+    // Validate the whole page before modifying the local checkpoint.
+    final found = (result['items'] as List? ?? [])
+        .map((j) => Conversation.fromJson(object(j)))
+        .toList();
+    if (found.any((c) => c.accountId != a.id)) {
+      throw const AppFailure('identity', '活跃会话账号不匹配');
+    }
+    for (final c in found) {
+      await store.db.transaction(() async {
+        final old = conversations.where((v) => v.key == c.key).firstOrNull;
+        final updated = old == null
+            ? c
+            : old.copyWith(
+                updatedAt: c.updatedAt > old.updatedAt
+                    ? c.updatedAt
+                    : old.updatedAt,
+              );
+        await _saveConversation(updated);
+        if (old == null &&
+            a.platform == 'dingtalk' &&
+            (c.kind == 'unknown' || (c.peerId.isEmpty && c.kind == 'p2p'))) {
+          // Activity summaries lack the peer ID needed for direct-message reads.
+          // Enumerate details before scheduling this new conversation.
+          _next.remove('account:${a.id}');
+        }
+        if ((old == null || c.updatedAt > old.updatedAt) &&
+            !isConversationExcluded(updated) &&
+            !blockedConversations.contains(c.key)) {
+          _pendingChecks.add(c.key);
+          _next.remove(c.key);
+        }
+      });
+    }
+    conversations.sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
+    await store.put('activeDiscovery', a.id, {
+      ...state,
+      'cursor': complete ? '' : next,
+      if (complete) 'completedUntil': state['end'],
+    }, account: a.id);
+    _next['active:${a.id}'] = now.add(Duration(seconds: complete ? 15 : 1));
+    changed();
+  });
+
   Future<void> refreshConversations(AccountRef a, {bool more = false}) =>
       activities.run(
         'conversations:${a.id}:$more',
@@ -853,6 +1020,7 @@ class Workspace extends ChangeNotifier {
               ? old.updatedAt
               : c.updatedAt,
         );
+        if (old == null) _pendingChecks.add(c.key);
         _upsertConversation(c);
         await store.put(
           'conversations',
@@ -875,6 +1043,7 @@ class Workspace extends ChangeNotifier {
         'checkedAt': DateTime.now().millisecondsSinceEpoch,
       });
     }
+    await _stopExcludedSubscriptions();
     conversations.sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
     activity.progress('已更新 ${(result['items'] as List? ?? []).length} 个会话');
     changed();
@@ -889,7 +1058,7 @@ class Workspace extends ChangeNotifier {
     selectedConversation = c.copyWith(unread: 0);
     await markRead(selectedConversation!);
     await loadMessages();
-    await syncConversation(c);
+    await syncConversation(c, manual: isConversationExcluded(c));
   }
 
   bool _isOwn(Message m) =>
@@ -1006,7 +1175,9 @@ class Workspace extends ChangeNotifier {
     for (final m in list) {
       final id = senderLookupId(m);
       if (id.isNotEmpty &&
-          (messageSenderName(m).isEmpty || messageSenderAvatar(m).isEmpty)) {
+          (messageSenderName(m).isEmpty ||
+              (messageSenderAvatar(m).isEmpty &&
+                  conversationSenderAvatar(m, conversations).isEmpty))) {
         queue[compositeKey(m.conversationId, id)] = m;
       }
     }
@@ -1050,6 +1221,7 @@ class Workspace extends ChangeNotifier {
         );
         activity.progress('正在查询 ${missing.length} 位联系人的名称与头像');
         var returned = <Json>[];
+        var lookupSucceeded = false;
         try {
           final c = conversations
               .where((c) => c.accountId == accountId && c.id == conversationId)
@@ -1070,6 +1242,7 @@ class Workspace extends ChangeNotifier {
             }),
           );
           returned = (response['items'] as List? ?? []).map(object).toList();
+          lookupSucceeded = true;
         } catch (e) {
           notice = '联系人资料暂不可用，将自动重试：$e';
           activity.finish(
@@ -1106,9 +1279,13 @@ class Workspace extends ChangeNotifier {
             'id': id,
             'name': name,
             'avatar': avatar,
+            if (lookupSucceeded && account(accountId).platform == 'feishu')
+              'avatarUnavailable': avatar.isEmpty && !hasFile,
             'expires': DateTime.now()
                 .add(
-                  name.isNotEmpty && (avatar.isNotEmpty || hasFile)
+                  (lookupSucceeded &&
+                              account(accountId).platform == 'feishu') ||
+                          (name.isNotEmpty && (avatar.isNotEmpty || hasFile))
                       ? const Duration(hours: 12)
                       : const Duration(seconds: 30),
                 )
@@ -1165,7 +1342,11 @@ class Workspace extends ChangeNotifier {
     bool older = false,
     bool manual = false,
   }) async {
-    if (blockedConversations.contains(c.key) || !_busy.add(c.key)) return;
+    if ((!manual && isConversationExcluded(c)) ||
+        blockedConversations.contains(c.key) ||
+        !_busy.add(c.key)) {
+      return;
+    }
     final state = sync[c.key] ??= SyncState();
     BackgroundActivity? activity;
     var received = 0, fetchedPages = 0;
@@ -1207,6 +1388,10 @@ class Workspace extends ChangeNotifier {
       var maxTime = (saved?['resumeMaxTime'] as int?) ?? since ?? 0;
       int? pageOldest;
       do {
+        if (!manual && isConversationExcluded(c)) {
+          activity.finish(state: 'completed', detail: '已排除自动同步');
+          return;
+        }
         final result = object(
           await rpc.call('messages', {
             'conversation': c.toJson(),
@@ -1216,6 +1401,10 @@ class Workspace extends ChangeNotifier {
             if (limitHistory) 'notBefore': cutoff,
           }),
         );
+        if (!manual && isConversationExcluded(c)) {
+          activity.finish(state: 'completed', detail: '已排除自动同步');
+          return;
+        }
         final items = (result['items'] as List? ?? [])
             .map((j) => Message.fromJson(object(j)))
             .toList();
@@ -1314,13 +1503,17 @@ class Workspace extends ChangeNotifier {
       state.lastSuccess = DateTime.now().millisecondsSinceEpoch;
       state.failures = 0;
       _backoff.remove(c.key);
-      if (a.platform == 'dingtalk' &&
+      if (!isConversationExcluded(c) &&
+          a.platform == 'dingtalk' &&
           (c.watched || c.key == selectedConversation?.key) &&
           !_streams.contains(c.key) &&
           !(_subscriptionRetry[c.key]?.isAfter(DateTime.now()) ?? false)) {
         _streams.add(c.key);
         try {
           await rpc.call('subscribe', {'conversation': c.toJson()});
+          // A rule may have unsubscribed while subscribe was still pending.
+          if (isConversationExcluded(c)) _streams.add(c.key);
+          await _stopExcludedSubscriptions();
         } catch (e) {
           _streams.remove(c.key);
           await _subscriptionFailed(a, c.id, '$e');
@@ -1378,6 +1571,7 @@ class Workspace extends ChangeNotifier {
         (c) =>
             account(c.accountId).enabled &&
             !blockedConversations.contains(c.key) &&
+            !isConversationExcluded(c) &&
             !_historyDone.contains(c.key) &&
             (c.updatedAt == 0 ||
                 c.updatedAt >= historyCutoff ||
@@ -1389,6 +1583,29 @@ class Workspace extends ChangeNotifier {
   void tick({DateTime? at}) {
     if (closing || _deletingAccounts.isNotEmpty) return;
     final now = at ?? DateTime.now();
+    for (final platform in accounts.map((a) => a.platform).toSet()) {
+      _tickPlatform(platform, now);
+    }
+  }
+
+  void _tickPlatform(String platform, DateTime now) {
+    final platformAccounts = accounts.where((a) => a.platform == platform);
+    final accountIds = platformAccounts.map((a) => a.id).toSet();
+    final platformConversations = conversations
+        .where((c) => accountIds.contains(c.accountId))
+        .toList();
+    final historyKey = 'history:$platform';
+    // Each plugin owns its slots so a slow platform cannot starve another.
+    final taskKeys = {
+      historyKey,
+      for (final a in platformAccounts) ...[
+        'account:${a.id}',
+        'discover:${a.id}',
+        'active:${a.id}',
+      ],
+      for (final c in platformConversations) c.key,
+    };
+    int pending() => _busy.where(taskKeys.contains).length;
     bool due(String key) =>
         !(_next[key]?.isAfter(now) ?? false) &&
         !(_backoff[key]?.isAfter(now) ?? false) &&
@@ -1397,13 +1614,19 @@ class Workspace extends ChangeNotifier {
         account(id).enabled &&
         !_updating.contains(account(id).platform) &&
         (_sendingAccounts[id] ?? 0) == 0;
-    for (final a in accounts.where((a) => available(a.id))) {
+    for (final a in platformAccounts.where((a) => available(a.id))) {
       final key = 'account:${a.id}';
-      if (due(key) && _busy.length < 4) {
+      if (due(key) && !_busy.contains('discover:${a.id}') && pending() < 4) {
         _busy.add(key);
-        _next[key] = now.add(const Duration(seconds: 30));
+        _next[key] = now.add(const Duration(hours: 3));
+        _pendingChecks.addAll(
+          platformConversations
+              .where((c) => c.accountId == a.id)
+              .map((c) => c.key),
+        );
         refreshConversations(a)
             .catchError((Object e) {
+              _next[key] = now.add(const Duration(seconds: 30));
               notice = '${a.label}：$e';
               changed();
             })
@@ -1411,7 +1634,7 @@ class Workspace extends ChangeNotifier {
       }
       // Discover remaining pages incrementally without delaying live requests.
       final moreKey = 'discover:${a.id}';
-      if (due(moreKey) && !_busy.contains(key) && _busy.length < 3) {
+      if (due(moreKey) && !_busy.contains(key) && pending() < 3) {
         _busy.add(moreKey);
         _next[moreKey] = now.add(const Duration(seconds: 10));
         (() async {
@@ -1426,16 +1649,43 @@ class Workspace extends ChangeNotifier {
             .whenComplete(() => _busy.remove(moreKey));
       }
     }
-    final candidates = conversations
+    for (final a in platformAccounts.where((a) => available(a.id))) {
+      final key = 'active:${a.id}';
+      if (!repositories.containsKey(a.platform) ||
+          !due(key) ||
+          pending() >= 3) {
+        continue;
+      }
+      _busy.add(key);
+      _next[key] = now.add(const Duration(seconds: 15));
+      refreshActiveConversations(a, at: now)
+          .catchError((Object e) {
+            notice = '${a.label} 活跃会话查询稍后重试：$e';
+            changed();
+          })
+          .whenComplete(() => _busy.remove(key));
+    }
+    final eligible = platformConversations
         .where(
           (c) =>
               available(c.accountId) &&
+              !(platform == 'dingtalk' &&
+                  (c.kind == 'unknown' ||
+                      (c.kind == 'p2p' && c.peerId.isEmpty))) &&
               !blockedConversations.contains(c.key) &&
-              (c.updatedAt == 0 ||
-                  c.updatedAt >= historyCutoff ||
-                  c.watched ||
-                  c.unread > 0 ||
-                  c.key == selectedConversation?.key),
+              !isConversationExcluded(c),
+        )
+        .toList();
+    final hotSince = now
+        .subtract(const Duration(hours: 1))
+        .millisecondsSinceEpoch;
+    final candidates = eligible
+        .where(
+          (c) =>
+              c.updatedAt >= hotSince ||
+              _pendingChecks.contains(c.key) ||
+              sync[c.key]?.gap == true ||
+              c.key == selectedConversation?.key,
         )
         .toList();
     candidates.sort((a, b) {
@@ -1446,19 +1696,30 @@ class Workspace extends ChangeNotifier {
       return b.unread.compareTo(a.unread);
     });
     for (final c in candidates) {
-      if (_busy.length >= 3) break;
+      if (pending() >= 3) break;
       if (!due(c.key)) continue;
       _next[c.key] = now.add(
         Duration(seconds: c.key == selectedConversation?.key ? 5 : 30),
       );
-      unawaited(syncConversation(c));
+      unawaited(
+        syncConversation(c).then((_) {
+          final state = sync[c.key];
+          if (state != null && state.error.isEmpty && !state.gap) {
+            _pendingChecks.remove(c.key);
+          }
+        }),
+      );
     }
-    // At most one history page at a time; give pending sends and live data priority.
-    if (!_busy.contains('history') && _busy.length < 4) {
+    // One history page per plugin; pending sends and live data keep priority.
+    if (!_busy.contains(historyKey) && pending() < 4) {
       final history =
-          candidates
+          eligible
               .where(
                 (c) =>
+                    (c.updatedAt == 0 ||
+                        c.updatedAt >= historyCutoff ||
+                        c.watched ||
+                        c.unread > 0) &&
                     (sync[c.key]?.lastSuccess ?? 0) > 0 &&
                     !_historyDone.contains(c.key) &&
                     !_busy.contains(c.key) &&
@@ -1474,11 +1735,11 @@ class Workspace extends ChangeNotifier {
       if (history.isNotEmpty) {
         final c = history.first;
         _next['history:${c.key}'] = now.add(const Duration(seconds: 10));
-        _busy.add('history');
+        _busy.add(historyKey);
         syncConversation(
           c,
           older: true,
-        ).whenComplete(() => _busy.remove('history'));
+        ).whenComplete(() => _busy.remove(historyKey));
       }
     }
   }

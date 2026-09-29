@@ -20,15 +20,22 @@ Future<void> main() async {
     ),
   );
   WidgetsBinding.instance.addPostFrameCallback((_) async {
+    workspace.startupTrace.mark('flutter.first-frame');
     await startWorkspace(
       workspace,
       directory: Platform.environment['IMBROGLIO_WORKSPACE'],
       showWindow: () async {
         await prepareWindow();
         if (Platform.isMacOS) {
-          await const MethodChannel(
+          final nativeUs = await const MethodChannel(
             'imbroglio/startup',
-          ).invokeMethod<void>('flutterReady');
+          ).invokeMethod<int>('flutterReady');
+          if (nativeUs != null) {
+            workspace.startupTrace.events.add({
+              'stage': 'native.window-to-flutter-ready',
+              'durationUs': nativeUs,
+            });
+          }
         }
         await windowManager.show();
         await windowManager.focus();

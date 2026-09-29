@@ -105,6 +105,25 @@ class BackgroundActivityBar extends ConsumerWidget {
   }
 }
 
+// Copy mutable activity values so progress notifications cannot change a snapshot.
+class _ActivitySnapshot {
+  _ActivitySnapshot(BackgroundActivity task)
+    : title = task.title,
+      scope = task.scope,
+      startedAt = task.startedAt,
+      finishedAt = task.finishedAt,
+      retryAt = task.retryAt,
+      state = task.state,
+      detail = task.detail,
+      running = task.running,
+      needsAttention = task.needsAttention;
+
+  final String title, scope, state, detail;
+  final DateTime startedAt;
+  final DateTime? finishedAt, retryAt;
+  final bool running, needsAttention;
+}
+
 class BackgroundActivityDialog extends ConsumerStatefulWidget {
   const BackgroundActivityDialog({super.key});
   @override
@@ -115,11 +134,26 @@ class BackgroundActivityDialog extends ConsumerStatefulWidget {
 class _BackgroundActivityDialogState
     extends ConsumerState<BackgroundActivityDialog> {
   Timer? _timer;
+  bool _autoRefresh = true;
+  List<_ActivitySnapshot> _items = [];
+  int _backgroundPending = 0;
+  DateTime _refreshedAt = DateTime.now();
+
+  void _capture() {
+    final w = ref.read(workspaceProvider);
+    _items = w.activities.items.map(_ActivitySnapshot.new).toList();
+    _backgroundPending = w.backgroundPending;
+    _refreshedAt = DateTime.now();
+  }
+
+  void _refresh() => setState(_capture);
+
   @override
   void initState() {
     super.initState();
-    _timer = Timer.periodic(const Duration(seconds: 1), (_) {
-      if (mounted) setState(() {});
+    _capture();
+    _timer = Timer.periodic(const Duration(seconds: 5), (_) {
+      if (mounted && _autoRefresh) _refresh();
     });
   }
 
@@ -131,8 +165,8 @@ class _BackgroundActivityDialogState
 
   String clock(DateTime time) =>
       '${time.hour.toString().padLeft(2, '0')}:${time.minute.toString().padLeft(2, '0')}:${time.second.toString().padLeft(2, '0')}';
-  Widget entry(BackgroundActivity task) {
-    final now = DateTime.now();
+  Widget entry(_ActivitySnapshot task) {
+    final now = _refreshedAt;
     final elapsed = (task.finishedAt ?? now)
         .difference(task.startedAt)
         .inSeconds;
@@ -177,10 +211,10 @@ class _BackgroundActivityDialogState
 
   @override
   Widget build(BuildContext context) {
-    final w = ref.watch(workspaceProvider);
-    final items = w.activities.items;
+    final items = _items;
     final running = items.where((e) => e.running).toList();
     final finished = items.where((e) => !e.running).toList();
+    final attentionCount = items.where((e) => e.needsAttention).length;
     return AlertDialog(
       title: const Text('后台活动'),
       content: SizedBox(
@@ -189,17 +223,38 @@ class _BackgroundActivityDialogState
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text(
-              '${running.length} 项进行中 · ${w.activities.attentionCount} 项需留意',
-            ),
-            if (w.backgroundPending > 0)
-              Text('近 7 天历史待补齐：${w.backgroundPending} 个会话'),
+            Text('${running.length} 项进行中 · $attentionCount 项需留意'),
+            if (_backgroundPending > 0)
+              Text('近 7 天历史待补齐：$_backgroundPending 个会话'),
             const Padding(
               padding: EdgeInsets.symmetric(vertical: 8),
               child: Text(
-                '显示本次运行的活动；重复同步合并显示最近一次。',
+                '显示本次运行的活动；重复同步合并显示最近一次。自动刷新间隔为 5 秒。',
                 style: TextStyle(fontSize: 12),
               ),
+            ),
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    '${_autoRefresh ? '自动刷新中' : '已暂停刷新'} · ${clock(_refreshedAt)} 更新',
+                    style: const TextStyle(fontSize: 12),
+                  ),
+                ),
+                TextButton.icon(
+                  onPressed: () => setState(() {
+                    _autoRefresh = !_autoRefresh;
+                    if (_autoRefresh) _capture();
+                  }),
+                  icon: Icon(_autoRefresh ? Icons.pause : Icons.play_arrow),
+                  label: Text(_autoRefresh ? '暂停刷新' : '恢复刷新'),
+                ),
+                TextButton.icon(
+                  onPressed: _refresh,
+                  icon: const Icon(Icons.refresh),
+                  label: const Text('立即刷新'),
+                ),
+              ],
             ),
             const Divider(),
             Expanded(

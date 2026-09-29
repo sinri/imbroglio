@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:drift/drift.dart';
 import 'package:drift/native.dart';
 import '../core/models.dart';
+import '../core/startup_trace.dart';
 import '../core/normalize.dart';
 
 class LocalDatabase extends GeneratedDatabase {
@@ -22,14 +23,15 @@ class Store {
   // Lets UI queries survive unrelated workspace notifications.
   int revision(String bucket) => _revisions[bucket] ?? 0;
   Store(QueryExecutor executor) : db = LocalDatabase(executor);
-  static Future<Store> open(String path) async {
+  static Future<Store> open(String path, {StartupTrace? trace}) async {
     final store = Store(NativeDatabase.createInBackground(File(path)));
-    await store.init();
+    await store.init(trace: trace);
     return store;
   }
 
-  Future<void> init() async {
+  Future<void> init({StartupTrace? trace}) async {
     await db.customStatement('PRAGMA journal_mode=WAL');
+    trace?.mark('database.worker-ready');
     await db.customStatement(
       'CREATE TABLE IF NOT EXISTS records (bucket TEXT NOT NULL, key TEXT NOT NULL, account TEXT NOT NULL DEFAULT \'\', conversation TEXT NOT NULL DEFAULT \'\', ts INTEGER NOT NULL DEFAULT 0, text TEXT NOT NULL DEFAULT \'\', body TEXT NOT NULL, PRIMARY KEY(bucket,key))',
     );
@@ -39,13 +41,19 @@ class Store {
     await db.customStatement(
       "CREATE VIRTUAL TABLE IF NOT EXISTS search_index USING fts5(bucket UNINDEXED, key UNINDEXED, account UNINDEXED, text, tokenize='trigram')",
     );
+    // A partial index avoids reading every message body on every launch,
+    // including when there are no legacy timestamps to repair.
+    await db.customStatement(
+      "CREATE INDEX IF NOT EXISTS records_legacy_message_time ON records(key) WHERE bucket='messages' AND ts<=0",
+    );
+    trace?.mark('database.schema-ready');
     // Repair old rows before LIMIT/ORDER BY uses their timestamp index.
     // Page by key so genuinely missing timestamps do not loop forever.
     String? after;
     while (true) {
       final rows = await db
           .customSelect(
-            "SELECT key,body FROM records WHERE bucket='messages' AND ts<=0${after == null ? '' : ' AND key>?'} ORDER BY key LIMIT 200",
+            "SELECT key,body FROM records INDEXED BY records_legacy_message_time WHERE bucket='messages' AND ts<=0${after == null ? '' : ' AND key>?'} ORDER BY key LIMIT 200",
             variables: [if (after != null) Variable(after)],
           )
           .get();
@@ -68,6 +76,7 @@ class Store {
       });
       after = rows.last.read<String>('key');
     }
+    trace?.mark('database.legacy-repair-ready');
     // A crash while sending cannot safely become an automatic retry.
     final pending = await list('outbox');
     for (final row in pending.where((e) => e['state'] == 'sending')) {
@@ -118,6 +127,30 @@ class Store {
     return rows.isEmpty
         ? null
         : object(jsonDecode(rows.first.read<String>('body')));
+  }
+
+  /// Fetch only the requested keys; chunking keeps SQLite parameter use bounded.
+  Future<Map<String, Json>> getMany(
+    String bucket,
+    Iterable<String> keys,
+  ) async {
+    final unique = keys.toSet().toList();
+    final result = <String, Json>{};
+    for (var offset = 0; offset < unique.length; offset += 400) {
+      final batch = unique.skip(offset).take(400).toList();
+      final rows = await db
+          .customSelect(
+            'SELECT key,body FROM records WHERE bucket=? AND key IN (${List.filled(batch.length, '?').join(',')})',
+            variables: [Variable(bucket), ...batch.map(Variable.new)],
+          )
+          .get();
+      for (final row in rows) {
+        result[row.read<String>('key')] = object(
+          jsonDecode(row.read<String>('body')),
+        );
+      }
+    }
+    return result;
   }
 
   Future<List<Json>> list(

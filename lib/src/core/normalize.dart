@@ -59,6 +59,7 @@ List<Json> rows(Object? value) {
       'items',
       'messages',
       'conversations',
+      'chats',
       'conversationList',
       'messageList',
       'list',
@@ -148,13 +149,25 @@ Conversation normalizeConversation(String account, Json j) {
     'id',
   ]);
   if (id.isEmpty) throw const AppFailure('contract', '会话响应缺少 ID，CLI 契约可能已变化');
-  final type = field(j, ['chat_type', 'type', 'conversationType', 'kind']);
+  final type = field(j, [
+    'chat_mode',
+    'chat_type',
+    'type',
+    'conversationType',
+    'kind',
+  ]);
   return Conversation(
     accountId: account,
     id: id,
     title: field(j, ['name', 'title', 'conversationTitle', 'nick'], id),
     kind: ['p2p', '1', 'single', 'o2o'].contains(type) ? 'p2p' : 'group',
-    peerId: field(j, ['peerId', 'openDingTalkId', 'peerOpenDingTalkId']),
+    peerId: field(j, [
+      'p2p_target_id',
+      'peerId',
+      'openDingTalkId',
+      'peerOpenDingTalkId',
+    ]),
+    avatar: avatarUrl(j),
     updatedAt: timestamp(
       j['last_message_time'] ??
           j['lastMessageTime'] ??
@@ -491,4 +504,20 @@ Json normalizeSenderProfile(Json j) {
         'avatarMediaId',
       ], field(employee, ['avatarMediaId'])),
   };
+}
+
+/// Only reuse a direct chat avatar when its peer identity matches the sender.
+String conversationSenderAvatar(
+  Message m,
+  Iterable<Conversation> conversations,
+) {
+  final id = senderLookupId(m);
+  if (id.isEmpty || m.extra['isOwn'] == true) return '';
+  for (final c in conversations) {
+    if (c.accountId == m.accountId && c.kind == 'p2p' && c.peerId == id) {
+      final avatar = avatarUrl(c.avatar);
+      if (avatar.isNotEmpty) return avatar;
+    }
+  }
+  return '';
 }

@@ -1,7 +1,10 @@
+import 'dart:convert';
 import 'package:flutter_test/flutter_test.dart';
 // The standalone adapter resolves shared models with file URIs.
 // ignore: avoid_relative_lib_imports
 import '../lib/src/core/models.dart';
+// ignore: avoid_relative_lib_imports
+import '../lib/src/core/normalize.dart';
 import '../bin/im_adapter.dart' as adapter;
 
 class RecordingAdapter extends adapter.Adapter {
@@ -32,6 +35,194 @@ class RecordingAdapter extends adapter.Adapter {
 }
 
 void main() {
+  test(
+    'DingTalk active continuation uses endpoint exhaustion metadata',
+    () async {
+      final a = RecordingAdapter('dingtalk')
+        ..response = jsonEncode({
+          'ok': true,
+          'data': {
+            'complete': false,
+            'conversations': [
+              {
+                'conversationId': 'chat',
+                'type': 'direct',
+                'name': 'Peer',
+                'latestMessageTime': '2026-09-29T01:00:00Z',
+              },
+            ],
+          },
+          'meta': {
+            'pagination': {'endpoint_exhausted': true},
+          },
+        });
+      final result = object(
+        await a.handle(1, 'conversations.active', {
+          'start': 1790640000000,
+          'end': 1790647200000,
+          'cursor': 'next',
+        }),
+      );
+      expect(result['complete'], true);
+      expect(object((result['items'] as List).single)['kind'], 'p2p');
+      expect(
+        a.command,
+        containsAllInOrder(['+recent-conversations', '--start']),
+      );
+      expect(a.command, containsAllInOrder(['--cursor', 'next']));
+      expect(a.command, containsAllInOrder(['--profile', 'exact-profile']));
+    },
+  );
+
+  test(
+    'Feishu active search aggregates messages by chat and carries pagination',
+    () async {
+      final a = RecordingAdapter('feishu')
+        ..response = jsonEncode({
+          'data': {
+            'has_more': true,
+            'page_token': 'next',
+            'messages': [
+              {
+                'chat_id': 'chat',
+                'chat_name': 'Chat',
+                'chat_type': 'group',
+                'create_time': '1790640000000',
+              },
+              {
+                'chat_id': 'chat',
+                'chat_name': 'Chat',
+                'chat_type': 'group',
+                'create_time': '1790640010000',
+              },
+            ],
+          },
+        });
+      final result = object(
+        await a.handle(1, 'conversations.active', {
+          'start': 1790640000000,
+          'end': 1790647200000,
+        }),
+      );
+      expect(result['complete'], false);
+      expect(result['cursor'], 'next');
+      expect(
+        object((result['items'] as List).single)['updatedAt'],
+        1790640010000,
+      );
+      expect(a.command, containsAllInOrder(['+messages-search', '--start']));
+      expect(a.command, containsAllInOrder(['--as', 'user']));
+    },
+  );
+
+  for (final platform in ['feishu', 'dingtalk']) {
+    test(
+      '$platform activity time parameters use whole-second ISO format',
+      () async {
+        final a = RecordingAdapter(platform)
+          ..response = jsonEncode({
+            'data': {
+              'complete': true,
+              'has_more': false,
+              'messages': [],
+              'conversations': [],
+            },
+          });
+        final start = DateTime.utc(
+          2026,
+          9,
+          29,
+          7,
+          27,
+          24,
+          123,
+        ).millisecondsSinceEpoch;
+        final end = DateTime.utc(2026, 9, 29, 8, 29, 24).millisecondsSinceEpoch;
+        await a.handle(1, 'conversations.active', {'start': start, 'end': end});
+        expect(
+          a.command[a.command.indexOf('--start') + 1],
+          '2026-09-29T07:27:24Z',
+        );
+        expect(
+          a.command[a.command.indexOf('--end') + 1],
+          '2026-09-29T08:29:24Z',
+        );
+      },
+    );
+  }
+
+  test('Feishu sender lookup preserves localized names and avatars', () async {
+    final a = RecordingAdapter('feishu')
+      ..response = {
+        'users': [
+          {
+            'open_id': 'ou_sender',
+            'localized_name': 'Sender',
+            'avatar': {'avatar_72': 'https://example.com/avatar.png'},
+          },
+        ],
+      };
+    final result = object(
+      await a.handle(1, 'contacts.resolve', {
+        'ids': ['ou_sender'],
+      }),
+    );
+    expect(
+      a.command,
+      containsAllInOrder([
+        'contact',
+        '+search-user',
+        '--user-ids',
+        'ou_sender',
+      ]),
+    );
+    expect(a.command, containsAllInOrder(['--as', 'user']));
+    expect((result['items'] as List).single, {
+      'id': 'ou_sender',
+      'name': 'Sender',
+      'avatar': 'https://example.com/avatar.png',
+    });
+  });
+  test('Feishu chat-list decodes chats and preserves pagination', () async {
+    final a = RecordingAdapter('feishu');
+    // Adapter.run unwraps the real CLI envelope before dispatching the result.
+    a.response = unwrap({
+      'ok': true,
+      'identity': 'user',
+      'data': {
+        'chats': [
+          {
+            'chat_id': 'old-chat',
+            'name': 'Existing chat',
+            'chat_mode': 'group',
+          },
+        ],
+        'has_more': true,
+        'page_token': 'next-page',
+      },
+      'meta': {
+        'pagination': {'complete': false, 'pages': 1, 'items': 1},
+      },
+    });
+    final first = object(await a.handle(1, 'conversations', {}));
+    expect((first['items'] as List).single, containsPair('id', 'old-chat'));
+    expect(
+      (first['items'] as List).single,
+      containsPair('accountId', 'account'),
+    );
+    expect(first['cursor'], 'next-page');
+    expect(a.command, containsAllInOrder(['--types', 'p2p,group']));
+    expect(a.command, containsAllInOrder(['--as', 'user']));
+
+    a.response = {'chats': [], 'has_more': false, 'page_token': ''};
+    final last = object(
+      await a.handle(2, 'conversations', {'cursor': first['cursor']}),
+    );
+    expect(a.command, containsAllInOrder(['--page-token', 'next-page']));
+    expect(last['items'], isEmpty);
+    expect(last['cursor'], isEmpty);
+  });
+
   test(
     'Feishu initial history bounds the start without changing descending order',
     () async {
