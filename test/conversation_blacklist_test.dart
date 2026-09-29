@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'package:flutter/gestures.dart';
 import 'package:drift/native.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -131,6 +132,86 @@ void main() {
       expect(calls, isNot(contains('subscribe')));
       expect(w.selectedConversation?.key, chat.key);
       expect(w.isConversationExcluded(chat), isTrue);
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  test(
+    'quick blacklist escapes special characters, scopes account and avoids duplicates',
+    () async {
+      const special = Conversation(
+        accountId: 'a',
+        id: 'special',
+        title: '通知*[项目](1)?',
+      );
+      w.conversations.add(special);
+      await w.blacklistConversation(special);
+      final rule = w.conversationBlacklist.single;
+      expect(rule.matches(special), isTrue);
+      expect(
+        rule.matches(
+          const Conversation(accountId: 'b', id: 'other', title: '通知*[项目](1)?'),
+        ),
+        isFalse,
+      );
+      expect(
+        rule.matches(
+          const Conversation(accountId: 'a', id: 'other', title: '通知项目1'),
+        ),
+        isFalse,
+      );
+      await w.blacklistConversation(special);
+      expect(w.conversationBlacklist, hasLength(1));
+      await w.loadSyncPolicies();
+      expect(w.isConversationExcluded(special), isTrue);
+    },
+  );
+
+  testWidgets(
+    'right-click adds blacklist without opening chat and marks existing exclusions',
+    (tester) async {
+      await tester.binding.setSurfaceSize(const Size(1120, 740));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      await tester.pumpWidget(
+        ProviderScope(
+          overrides: [workspaceProvider.overrideWith((ref) => w)],
+          child: MaterialApp(
+            home: Scaffold(body: MessagesPage(onSetup: () {})),
+          ),
+        ),
+      );
+      Future<void> rightClick() async {
+        final mouse = await tester.createGesture(
+          kind: PointerDeviceKind.mouse,
+          buttons: kSecondaryMouseButton,
+        );
+        await mouse.down(tester.getCenter(find.text('通知群')));
+        await mouse.up();
+        await mouse.removePointer();
+        await tester.pumpAndSettle();
+      }
+
+      await rightClick();
+      expect(find.text('加入黑名单'), findsOneWidget);
+      expect(w.selectedConversation, isNull);
+      expect(calls, isEmpty);
+      await tester.tap(find.text('加入黑名单'));
+      await tester.runAsync(
+        () => Future<void>.delayed(const Duration(milliseconds: 50)),
+      );
+      await tester.pumpAndSettle();
+      expect(w.isConversationExcluded(chat), isTrue);
+      expect(w.conversationBlacklist, hasLength(1));
+      expect(find.text('通知群'), findsOneWidget);
+      expect(calls, isEmpty);
+      await rightClick();
+      expect(find.text('已在黑名单中'), findsOneWidget);
+      expect(
+        tester
+            .widget<PopupMenuItem<String>>(find.byType(PopupMenuItem<String>))
+            .enabled,
+        isFalse,
+      );
       expect(tester.takeException(), isNull);
     },
   );

@@ -132,6 +132,19 @@ class Workspace extends ChangeNotifier {
     return c != null && isConversationExcluded(c);
   }
 
+  Future<void> blacklistConversation(Conversation c) async {
+    final current = conversations.where((v) => v.key == c.key).firstOrNull ?? c;
+    if (isConversationExcluded(current)) return;
+    await saveConversationBlacklist([
+      ..._conversationBlacklist,
+      ConversationBlacklistRule(
+        accountId: current.accountId,
+        pattern: '^${RegExp.escape(current.title)}\$',
+        regex: true,
+      ),
+    ]);
+  }
+
   Future<void> saveConversationBlacklist(
     List<ConversationBlacklistRule> rules,
   ) async {
