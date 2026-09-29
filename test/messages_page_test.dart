@@ -64,6 +64,92 @@ void main() {
     await tester.pumpAndSettle();
   }
 
+  for (final lastAccount in [false, true]) {
+    testWidgets(
+      'logout clears selected chat and ${lastAccount ? 'shows setup' : 'selects a remaining account'}',
+      (tester) async {
+        w.selectedAccount = 'a';
+        if (!lastAccount) {
+          w.accounts.add(
+            const AccountRef(
+              id: 'b',
+              platform: 'dingtalk',
+              label: '保留的钉钉',
+              enabled: false,
+            ),
+          );
+          w.conversations.add(
+            const Conversation(accountId: 'b', id: 'other', title: '钉钉群'),
+          );
+        }
+        await open(tester);
+        expect(w.selectedConversation?.key, chat.key);
+        w.clients['a'] = FakeRpc((method, _) => {});
+        await w.disconnect(w.account('a'), logout: true);
+        await tester.pumpAndSettle();
+        expect(w.selectedConversation, isNull);
+        expect(w.messages, isEmpty);
+        expect(find.text('测试群'), findsNothing);
+        expect(w.selectedAccount, lastAccount ? isNull : 'b');
+        if (lastAccount) {
+          expect(find.text('连接账号'), findsOneWidget);
+          expect(find.byType(DropdownButtonFormField<String>), findsNothing);
+        } else {
+          final dropdown = tester.widget<DropdownButtonFormField<String>>(
+            find.byType(DropdownButtonFormField<String>),
+          );
+          expect(dropdown.initialValue, 'b');
+          expect(find.text('钉钉群'), findsOneWidget);
+          await tester.tap(find.byType(DropdownButtonFormField<String>));
+          await tester.pumpAndSettle();
+          expect(find.text('账号'), findsNothing);
+          expect(find.text('保留的钉钉'), findsWidgets);
+        }
+        expect(tester.takeException(), isNull);
+      },
+    );
+  }
+
+  testWidgets('persisted signed-out accounts and chats stay hidden', (
+    tester,
+  ) async {
+    await w.store.put(
+      'accounts',
+      'a',
+      w.account('a').copyWith(signedOut: true).toJson(),
+    );
+    const remaining = AccountRef(
+      id: 'b',
+      platform: 'dingtalk',
+      label: '保留的钉钉',
+      enabled: false,
+    );
+    await w.store.put('accounts', 'b', remaining.toJson());
+    w.accounts = (await w.store.list(
+      'accounts',
+    )).map(AccountRef.fromJson).toList();
+    w.selectedAccount = 'a';
+    w.changed();
+    await tester.binding.setSurfaceSize(const Size(1120, 740));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [workspaceProvider.overrideWith((ref) => w)],
+        child: MaterialApp(
+          home: Scaffold(body: MessagesPage(onSetup: () {})),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(w.selectedAccount, 'b');
+    expect(find.text('测试群'), findsNothing);
+    await tester.tap(find.byType(DropdownButtonFormField<String>));
+    await tester.pumpAndSettle();
+    expect(find.text('账号'), findsNothing);
+    expect(find.text('保留的钉钉'), findsWidgets);
+    expect(tester.takeException(), isNull);
+  });
+
   testWidgets('sync errors survive recovery until manually closed', (
     tester,
   ) async {

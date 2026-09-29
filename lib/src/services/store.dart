@@ -17,6 +17,10 @@ class LocalDatabase extends GeneratedDatabase {
 
 class Store {
   final LocalDatabase db;
+  final _revisions = <String, int>{};
+  final _deletedAccounts = <String>{};
+  // Lets UI queries survive unrelated workspace notifications.
+  int revision(String bucket) => _revisions[bucket] ?? 0;
   Store(QueryExecutor executor) : db = LocalDatabase(executor);
   static Future<Store> open(String path) async {
     final store = Store(NativeDatabase.createInBackground(File(path)));
@@ -81,6 +85,11 @@ class Store {
     String text = '',
   }) async {
     await db.transaction(() async {
+      if (_deletedAccounts.any(
+        (id) => _belongsToAccount(id, bucket, key, account, data),
+      )) {
+        return;
+      }
       await db.customStatement(
         'INSERT INTO records(bucket,key,account,conversation,ts,text,body) VALUES(?,?,?,?,?,?,?) ON CONFLICT(bucket,key) DO UPDATE SET account=excluded.account,conversation=excluded.conversation,ts=excluded.ts,text=excluded.text,body=excluded.body',
         [bucket, key, account, conversation, ts, text, jsonEncode(data)],
@@ -96,6 +105,7 @@ class Store {
         );
       }
     });
+    _revisions[bucket] = revision(bucket) + 1;
   }
 
   Future<Json?> get(String bucket, String key) async {
@@ -141,6 +151,104 @@ class Store {
         [bucket, key],
       );
     });
+    _revisions[bucket] = revision(bucket) + 1;
+  }
+
+  bool _belongsToAccount(
+    String id,
+    String bucket,
+    String key,
+    String owner,
+    Json body,
+  ) {
+    if (owner == id || body['accountId'] == id || body['account'] == id) {
+      return true;
+    }
+    if ((bucket == 'accounts' || bucket == 'discovery') && key == id) {
+      return true;
+    }
+    if (bucket == 'cursors' && key == 'conversations:$id') return true;
+    if (bucket == 'agentSessions') {
+      if ((body['scope'] as List? ?? []).contains(id)) return true;
+      if (object(
+        body['sources'],
+      ).values.any((v) => object(v)['accountId'] == id)) {
+        return true;
+      }
+    }
+    // Legacy sync/read rows have no account column; attachments nest a message key.
+    var part = key;
+    while (part.startsWith('[')) {
+      try {
+        final decoded = jsonDecode(part);
+        if (decoded is! List || decoded.isEmpty || decoded.first is! String) {
+          break;
+        }
+        part = decoded.first as String;
+        if (part == id) return true;
+      } catch (_) {
+        break;
+      }
+    }
+    return false;
+  }
+
+  Future<void> deleteAccount(String id) async {
+    await db.transaction(() async {
+      final rows = await db
+          .customSelect('SELECT bucket,key,account,body FROM records')
+          .get();
+      final auditIds = <String>{};
+      for (final row in rows) {
+        final body = object(jsonDecode(row.read<String>('body')));
+        if (row.read<String>('bucket') == 'audit' &&
+            body['account'] == id &&
+            body['id'] is String) {
+          auditIds.add(body['id'] as String);
+        }
+      }
+      for (final row in rows) {
+        final bucket = row.read<String>('bucket'),
+            key = row.read<String>('key');
+        final body = object(jsonDecode(row.read<String>('body')));
+        if (_belongsToAccount(
+              id,
+              bucket,
+              key,
+              row.read<String>('account'),
+              body,
+            ) ||
+            (bucket == 'audit' && auditIds.contains(body['id']))) {
+          await remove(bucket, key);
+        } else if (bucket == 'installations') {
+          void stripBackups(Json record) {
+            if (record['rollbackConfigs'] is Map) {
+              record['rollbackConfigs'] = {...object(record['rollbackConfigs'])}
+                ..remove(id);
+            }
+            if (record['previous'] is Map) {
+              final previous = object(record['previous']);
+              stripBackups(previous);
+              record['previous'] = previous;
+            }
+          }
+
+          stripBackups(body);
+          await put(bucket, key, body);
+        }
+      }
+      await db.customStatement('DELETE FROM search_index WHERE account=?', [
+        id,
+      ]);
+      // Rebuild FTS segments so deleted text is no longer kept in old segments.
+      await db.customStatement(
+        "INSERT INTO search_index(search_index) VALUES('rebuild')",
+      );
+      _deletedAccounts.add(id);
+    });
+    // Reclaim deleted payload pages and truncate the application's SQLite WAL.
+    await db.customStatement('VACUUM');
+    await db.customStatement('PRAGMA wal_checkpoint(TRUNCATE)');
   }
 
   Future<void> saveMessage(Message m) => put(

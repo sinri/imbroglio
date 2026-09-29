@@ -29,6 +29,7 @@ class _AgentPageState extends ConsumerState<AgentPage> {
     final plugins = w.packages
         .where((p) => p['kind'] == 'agent' && p['enabled'] == true)
         .toList();
+    scope.retainAll(w.visibleAccounts.map((a) => a.id));
     if (!scopeChosen && w.selectedAccount != null) {
       scope.add(w.selectedAccount!);
       scopeChosen = true;
@@ -84,7 +85,7 @@ class _AgentPageState extends ConsumerState<AgentPage> {
           Wrap(
             spacing: 6,
             runSpacing: 6,
-            children: w.accounts
+            children: w.visibleAccounts
                 .map(
                   (a) => FilterChip(
                     label: Text(a.label),

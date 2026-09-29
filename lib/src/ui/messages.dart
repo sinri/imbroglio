@@ -121,7 +121,7 @@ class _MessagesPageState extends ConsumerState<MessagesPage> {
   Widget build(BuildContext context) {
     final w = ref.watch(workspaceProvider),
         scheme = Theme.of(context).colorScheme;
-    if (w.accounts.isEmpty) {
+    if (w.visibleAccounts.isEmpty) {
       return emptyState(
         context,
         Icons.forum_outlined,
@@ -130,7 +130,7 @@ class _MessagesPageState extends ConsumerState<MessagesPage> {
         action: FilledButton.icon(
           onPressed: widget.onSetup,
           icon: const Icon(Icons.add),
-          label: const Text('安装连接器'),
+          label: const Text('连接账号'),
         ),
       );
     }
@@ -145,6 +145,7 @@ class _MessagesPageState extends ConsumerState<MessagesPage> {
         w.conversations
             .where(
               (c) =>
+                  w.visibleAccounts.any((a) => a.id == c.accountId) &&
                   (w.selectedAccount == null ||
                       c.accountId == w.selectedAccount) &&
                   c.title.toLowerCase().contains(filter.text.toLowerCase()),
@@ -163,12 +164,13 @@ class _MessagesPageState extends ConsumerState<MessagesPage> {
                 child: Column(
                   children: [
                     DropdownButtonFormField<String>(
+                      key: ValueKey(w.selectedAccount),
                       initialValue: w.selectedAccount,
                       decoration: const InputDecoration(
                         labelText: '当前账号',
                         isDense: true,
                       ),
-                      items: w.accounts
+                      items: w.visibleAccounts
                           .map(
                             (a) => DropdownMenuItem(
                               value: a.id,
@@ -414,7 +416,7 @@ class _MessagesPageState extends ConsumerState<MessagesPage> {
                               child: TextButton.icon(
                                 onPressed: () => guarded(
                                   context,
-                                  () => w.showEarlierMessages(),
+                                  () => w.showEarlierMessages(manual: true),
                                 ),
                                 icon: const Icon(Icons.history, size: 16),
                                 label: Text(

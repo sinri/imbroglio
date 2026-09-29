@@ -47,6 +47,21 @@ void main() {
     );
     expect((await rpc.call('fast'))['method'], 'fast');
   });
+  test(
+    'cancellation only fails selected requests and permits subsequent calls',
+    () async {
+      final waiting = rpc.call('hang');
+      final other = rpc.call('slow');
+      final assertion = expectLater(
+        waiting,
+        throwsA(isA<AppFailure>().having((e) => e.code, 'code', 'cancelled')),
+      );
+      rpc.cancelPending({'hang'});
+      await assertion;
+      expect((await other)['method'], 'slow');
+      expect((await rpc.call('fast'))['method'], 'fast');
+    },
+  );
   test('crashed process fails pending and future requests', () async {
     final diagnostic = rpc.events.stream.firstWhere(
       (e) => e['method'] == 'diagnostic',

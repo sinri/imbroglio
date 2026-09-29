@@ -25,6 +25,8 @@ class _SearchPageState extends ConsumerState<SearchPage> {
   @override
   Widget build(BuildContext context) {
     final w = ref.watch(workspaceProvider);
+    results.removeWhere((r) => w.deletedAccountIds.contains(r.accountId));
+    scope.retainAll(w.visibleAccounts.map((a) => a.id));
     if (!scopeChosen && w.selectedAccount != null) {
       scope.add(w.selectedAccount!);
       scopeChosen = true;
@@ -62,7 +64,7 @@ class _SearchPageState extends ConsumerState<SearchPage> {
             spacing: 8,
             runSpacing: 8,
             children: [
-              ...w.accounts.map(
+              ...w.visibleAccounts.map(
                 (a) => FilterChip(
                   label: Text(a.label),
                   selected: scope.contains(a.id),

@@ -8,6 +8,8 @@ import 'package:imbroglio/src/services/store.dart';
 import 'package:imbroglio/src/services/workspace.dart';
 
 class FakeRpc implements RpcClient {
+  bool closed = false;
+  final cancelledMethods = <String>{};
   final FutureOr<dynamic> Function(String, Json) handler;
   FakeRpc(this.handler);
   @override
@@ -17,9 +19,14 @@ class FakeRpc implements RpcClient {
     Duration timeout = const Duration(seconds: 45),
   ]) async => handler(method, params);
   @override
-  Future<void> close() async {}
+  Future<void> close() async {
+    closed = true;
+  }
+
   @override
   void notify(String method, Json params) {}
+  @override
+  void cancelPending(Set<String> methods) => cancelledMethods.addAll(methods);
   @override
   bool get hasPending => false;
   @override
@@ -54,6 +61,217 @@ void main() {
     }
     temporaryDirectories.clear();
   });
+  test(
+    'partial login continues verification and preserves a visible permissions warning',
+    () async {
+      final calls = <String>[];
+      w.clients['a'] = FakeRpc((method, _) {
+        calls.add(method);
+        return method == 'auth.login'
+            ? {
+                'completed': true,
+                'warning': '部分权限未授予',
+                'missingScopes': ['optional.scope'],
+              }
+            : {'status': 'ok'};
+      });
+      final result = await w.authenticate(account);
+      expect(calls, ['auth.login', 'auth.status']);
+      expect(result['warning'], '部分权限未授予');
+      expect(w.notice, contains('部分权限未授予'));
+    },
+  );
+  test(
+    'initial import stops at seven days; explicit manual history bypasses that boundary',
+    () async {
+      final now = DateTime.now().millisecondsSinceEpoch;
+      final recent = now - const Duration(days: 6).inMilliseconds;
+      final old = now - const Duration(days: 8).inMilliseconds;
+      final requests = <Json>[];
+      w.clients['a'] = FakeRpc((method, args) {
+        if (method != 'messages') return {};
+        requests.add(args);
+        if (requests.length == 1) {
+          return {
+            'items': [message('recent', recent), message('old', old)],
+            'hasMore': true,
+            'cursor': 'automatic-next',
+          };
+        }
+        return {
+          'items': [message('old', old)],
+          'hasMore': false,
+        };
+      });
+      await w.syncConversation(conversation);
+      expect(
+        requests.single['notBefore'],
+        closeTo(now - const Duration(days: 7).inMilliseconds, 2000),
+      );
+      expect(
+        await w.store.get('messages', compositeKey('a', 'recent')),
+        isNotNull,
+      );
+      expect(await w.store.get('messages', compositeKey('a', 'old')), isNull);
+      expect(
+        (await w.store.get('cursors', conversation.key))!['historyDone'],
+        true,
+      );
+      w.selectedConversation = conversation;
+      await w.showEarlierMessages();
+      expect(requests.length, 1);
+      await w.showEarlierMessages(manual: true);
+      expect(requests.length, 2);
+      expect(requests.last.containsKey('notBefore'), false);
+      expect(requests.last['cursor'], isNull);
+      expect(requests.last['before'], recent);
+      expect(
+        await w.store.get('messages', compositeKey('a', 'old')),
+        isNotNull,
+      );
+      expect(
+        (await w.store.get('cursors', conversation.key))!['manualHistoryDone'],
+        true,
+      );
+      await w.showEarlierMessages(manual: true);
+      expect(requests.length, 2);
+    },
+  );
+
+  test('manual history keeps its own pagination checkpoint', () async {
+    final now = DateTime.now().millisecondsSinceEpoch;
+    await w.store.saveMessage(Message.fromJson(message('recent', now)));
+    await w.store.put('cursors', conversation.key, {
+      'timestamp': now,
+      'historyDone': true,
+      'historyCursor': 'automatic-cursor',
+    });
+    final requests = <Json>[];
+    w.clients['a'] = FakeRpc((method, args) {
+      requests.add(args);
+      return {
+        'items': [
+          message(
+            'old${requests.length}',
+            now - Duration(days: 8 + requests.length).inMilliseconds,
+          ),
+        ],
+        'hasMore': requests.length == 1,
+        'cursor': requests.length == 1 ? 'manual-next' : '',
+      };
+    });
+    await w.syncConversation(conversation, older: true, manual: true);
+    await w.syncConversation(conversation, older: true, manual: true);
+    expect(requests.first['cursor'], isNull);
+    expect(requests.last['cursor'], 'manual-next');
+    expect(requests.last['before'], requests.first['before']);
+    final saved = (await w.store.get('cursors', conversation.key))!;
+    expect(saved['historyCursor'], 'automatic-cursor');
+    expect(saved['manualHistoryDone'], true);
+  });
+  test('logout failure still closes the client and pauses syncing', () async {
+    final rpc = FakeRpc((method, args) {
+      if (method == 'auth.logout') throw const AppFailure('test', '注销失败');
+      return {};
+    });
+    w.clients['a'] = rpc;
+    await expectLater(
+      w.disconnect(account, logout: true),
+      throwsA(isA<AppFailure>()),
+    );
+    expect(rpc.closed, true);
+    expect(w.clients, isEmpty);
+    expect(w.account('a').enabled, false);
+  });
+  for (final methodToCancel in [
+    'auth.configure',
+    'auth.login',
+    'auth.status',
+  ]) {
+    test('cancel $methodToCancel stops the flow and permits retry', () async {
+      final entered = Completer<void>();
+      final pending = Completer<Json>();
+      final methods = <String>[];
+      var first = true;
+      final rpc = FakeRpc((method, args) {
+        methods.add(method);
+        if (first && method == methodToCancel) {
+          entered.complete();
+          return pending.future;
+        }
+        return {};
+      });
+      w.clients['a'] = rpc;
+      final attempt = w.authenticate(account, configure: true);
+      final assertion = expectLater(
+        attempt,
+        throwsA(isA<AppFailure>().having((e) => e.code, 'code', 'cancelled')),
+      );
+      await entered.future;
+      w.authUrls['a'] = 'https://example.com/authorization';
+      w.cancelAuthentication(account);
+      await assertion;
+      expect(w.authUrls, isEmpty);
+      expect(rpc.cancelledMethods, contains(methodToCancel));
+      expect(methods.last, methodToCancel);
+      first = false;
+      methods.clear();
+      await w.authenticate(account);
+      expect(methods, ['auth.login', 'auth.status']);
+      pending.complete({});
+      await Future<void>.delayed(Duration.zero);
+      expect(methods, ['auth.login', 'auth.status']);
+    });
+  }
+  test(
+    'authentication reports stages and clears obsolete authorization URLs',
+    () async {
+      final stages = <String>[];
+      final methods = <String>[];
+      w.authUrls['a'] = 'https://example.com/old';
+      w.clients['a'] = FakeRpc((method, args) {
+        methods.add(method);
+        expect(w.authUrls['a'], isNull);
+        if (method != 'auth.status') {
+          w.authUrls['a'] = 'https://example.com/current';
+        }
+        return {'status': 'ok'};
+      });
+      await w.authenticate(account, configure: true, onStage: stages.add);
+      expect(methods, ['auth.configure', 'auth.login', 'auth.status']);
+      expect(stages, ['应用初始化', '用户授权', '连接验证']);
+      expect(w.authUrls, isEmpty);
+    },
+  );
+
+  for (final failure in {
+    'auth.configure': '应用初始化',
+    'auth.login': '用户授权',
+    'auth.status': '连接验证',
+  }.entries) {
+    test('authentication identifies failure at ${failure.key}', () async {
+      final methods = <String>[];
+      w.clients['a'] = FakeRpc((method, args) {
+        methods.add(method);
+        if (method == failure.key) {
+          w.authUrls['a'] = 'https://example.com/expired';
+          throw const AppFailure('authentication', 'denied', retryAfter: 7);
+        }
+        return {};
+      });
+      await expectLater(
+        w.authenticate(account, configure: true),
+        throwsA(
+          isA<AppFailure>()
+              .having((e) => e.message, 'message', '${failure.value}失败：denied')
+              .having((e) => e.code, 'code', 'authentication')
+              .having((e) => e.retryAfter, 'retryAfter', 7),
+        ),
+      );
+      expect(methods.last, failure.key);
+      expect(w.authUrls, isEmpty);
+    });
+  }
   test(
     'selecting a chat preserves its position among equal timestamps',
     () async {
@@ -92,11 +310,14 @@ void main() {
   test(
     'initial history establishes a live checkpoint without announcing all history',
     () async {
+      final timestamp = DateTime.now()
+          .subtract(const Duration(hours: 1))
+          .millisecondsSinceEpoch;
       var notifications = 0;
       w.onIncoming = (_) => notifications++;
       w.clients['a'] = FakeRpc(
         (method, args) => {
-          'items': [message('m', 5000)],
+          'items': [message('m', timestamp)],
           'hasMore': true,
           'cursor': 'older',
         },
@@ -104,7 +325,7 @@ void main() {
       await w.syncConversation(conversation);
       expect(
         (await w.store.get('cursors', conversation.key))!['timestamp'],
-        5000,
+        timestamp,
       );
       expect(w.sync[conversation.key]!.gap, false);
       expect(notifications, 0);
@@ -212,8 +433,8 @@ void main() {
       w.clients['a'] = FakeRpc(
         (method, args) => {
           'items': [
-            message('within', now - const Duration(days: 30).inMilliseconds),
-            message('outside', now - const Duration(days: 100).inMilliseconds),
+            message('within', now - const Duration(days: 6).inMilliseconds),
+            message('outside', now - const Duration(days: 8).inMilliseconds),
           ],
           'hasMore': true,
         },

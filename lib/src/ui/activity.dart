@@ -193,7 +193,7 @@ class _BackgroundActivityDialogState
               '${running.length} 项进行中 · ${w.activities.attentionCount} 项需留意',
             ),
             if (w.backgroundPending > 0)
-              Text('近 90 天历史待补齐：${w.backgroundPending} 个会话'),
+              Text('近 7 天历史待补齐：${w.backgroundPending} 个会话'),
             const Padding(
               padding: EdgeInsets.symmetric(vertical: 8),
               child: Text(

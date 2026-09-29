@@ -44,6 +44,10 @@ class ActivityLog {
     return task;
   }
 
+  void removeScope(String scope) {
+    _items.removeWhere((item) => item.scope == scope);
+  }
+
   void _trim() {
     final finished = _items.where((e) => !e.running).toList();
     for (final entry in finished.skip(40)) {

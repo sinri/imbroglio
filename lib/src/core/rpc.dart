@@ -8,6 +8,7 @@ import 'diagnostics.dart';
 class RpcClient {
   final Process process;
   final _pending = <int, Completer<dynamic>>{};
+  final _methods = <int, String>{};
   final events = StreamController<Json>.broadcast();
   int _sequence = 0;
   bool _closed = false;
@@ -82,6 +83,7 @@ class RpcClient {
     final id = ++_sequence;
     final c = Completer<dynamic>();
     _pending[id] = c;
+    _methods[id] = method;
     try {
       process.stdin.writeln(
         jsonEncode({
@@ -97,6 +99,17 @@ class RpcClient {
       throw const AppFailure('timeout', '请求超时，写入结果可能未知，请先核对');
     } finally {
       _pending.remove(id);
+      _methods.remove(id);
+    }
+  }
+
+  void cancelPending(Set<String> methods) {
+    for (final entry in _methods.entries.toList()) {
+      if (!methods.contains(entry.value)) continue;
+      final pending = _pending.remove(entry.key);
+      if (pending == null || pending.isCompleted) continue;
+      notify('cancel', {'id': entry.key});
+      pending.completeError(const AppFailure('cancelled', '授权已中止'));
     }
   }
 

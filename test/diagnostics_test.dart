@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'package:drift/native.dart';
 import 'package:flutter/material.dart';
@@ -36,6 +37,61 @@ class DiagnosticAdapter extends adapter.Adapter {
 }
 
 void main() {
+  for (final completed in [true, false]) {
+    test(
+      'exit 3 ${completed ? 'accepts explicit completed login with missing scopes' : 'rejects actual authorization failure'}',
+      () async {
+        final dir = await Directory.systemTemp.createTemp(
+          'imbroglio-partial-login-',
+        );
+        try {
+          final payload = completed
+              ? {
+                  'event': 'authorization_complete',
+                  'user_open_id': 'test-user',
+                  'granted': ['im:chat:read'],
+                  'missing': ['vc:meeting.realtime:read'],
+                  'warning': {'type': 'missing_scope'},
+                }
+              : {
+                  'event': 'authorization_failed',
+                  'error': 'user denied request',
+                };
+          final script = File('${dir.path}/cli');
+          await script.writeAsString(
+            "#!/bin/sh\ncat <<'RESULT'\n${jsonEncode(payload)}\nRESULT\nexit 3\n",
+          );
+          await Process.run('chmod', ['+x', script.path]);
+          final cli = DiagnosticAdapter()
+            ..binary = script.path
+            ..directory = dir.path
+            ..platform = 'feishu'
+            ..accountId = 'a'
+            ..initialized = true;
+          if (completed) {
+            final result = await cli.handle(1, 'auth.login', {});
+            expect(result['completed'], true);
+            expect(result['missingScopes'], ['vc:meeting.realtime:read']);
+            expect(result['warning'], contains('权限未授予'));
+            expect(cli.captured, isEmpty);
+          } else {
+            await expectLater(
+              cli.handle(1, 'auth.login', {}),
+              throwsA(
+                isA<wire.AppFailure>().having(
+                  (e) => e.message,
+                  'message',
+                  contains('user denied request'),
+                ),
+              ),
+            );
+          }
+        } finally {
+          await dir.delete(recursive: true);
+        }
+      },
+    );
+  }
   const a = AccountRef(id: 'a', platform: 'dingtalk', label: '测试账号');
   const c = Conversation(accountId: 'a', id: 'c', title: '测试群', watched: true);
   late Workspace w;
@@ -59,6 +115,93 @@ void main() {
     }
     expect(diagnosticText('x' * 10000).length, lessThanOrEqualTo(4097));
   });
+  test(
+    'authorization cancellation terminates the CLI without an error diagnostic',
+    () async {
+      final dir = await Directory.systemTemp.createTemp(
+        'imbroglio-auth-cancel-',
+      );
+      try {
+        final script = File('${dir.path}/cli');
+        await script.writeAsString('#!/bin/sh\nexec sleep 60\n');
+        await Process.run('chmod', ['+x', script.path]);
+        final cli = DiagnosticAdapter()
+          ..binary = script.path
+          ..directory = dir.path
+          ..platform = 'feishu'
+          ..accountId = 'a'
+          ..initialized = true;
+        final attempt = cli.handle(1, 'auth.login', {});
+        final assertion = expectLater(
+          attempt,
+          throwsA(
+            isA<wire.AppFailure>().having((e) => e.code, 'code', 'cancelled'),
+          ),
+        );
+        // Also covers cancellation while Process.start has not returned yet.
+        cli.cancel(1);
+        await assertion.timeout(const Duration(seconds: 5));
+        expect(cli.processes, isEmpty);
+        expect(cli.captured, isEmpty);
+      } finally {
+        await dir.delete(recursive: true);
+      }
+    },
+  );
+
+  test(
+    'adapter surfaces a mixed-output authorization failure from a process',
+    () async {
+      final dir = await Directory.systemTemp.createTemp(
+        'imbroglio-auth-error-',
+      );
+      try {
+        final script = File('${dir.path}/cli');
+        await script.writeAsString('''#!/bin/sh
+cat >&2 <<'ERROR'
+等待浏览器授权……
+{
+  "ok": false,
+  "error": {
+    "type": "authentication",
+    "message": "failed to get user info",
+    "hint": "check permissions"
+  }
+}
+ERROR
+exit 3
+''');
+        await Process.run('chmod', ['+x', script.path]);
+        final cli = DiagnosticAdapter()
+          ..binary = script.path
+          ..directory = dir.path
+          ..platform = 'feishu'
+          ..accountId = 'a'
+          ..initialized = true;
+        await expectLater(
+          cli.handle(1, 'auth.login', {}),
+          throwsA(
+            isA<wire.AppFailure>()
+                .having((e) => e.code, 'code', 'authentication')
+                .having(
+                  (e) => e.message,
+                  'message',
+                  contains('failed to get user info'),
+                )
+                .having(
+                  (e) => e.message,
+                  'hint',
+                  contains('check permissions'),
+                ),
+          ),
+        );
+        expect(cli.captured.single['exitCode'], 3);
+        expect(cli.processes, isEmpty);
+      } finally {
+        await dir.delete(recursive: true);
+      }
+    },
+  );
 
   test(
     'confidential rejection disables live and history requests across restart',

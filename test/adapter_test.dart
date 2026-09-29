@@ -33,6 +33,33 @@ class RecordingAdapter extends adapter.Adapter {
 
 void main() {
   test(
+    'Feishu initial history bounds the start without changing descending order',
+    () async {
+      final a = RecordingAdapter('feishu');
+      await a.handle(1, 'messages', {
+        'conversation': {'id': 'c'},
+        'notBefore': 1700000000000,
+      });
+      expect(
+        a.command,
+        containsAllInOrder([
+          '--order',
+          'desc',
+          '--start',
+          DateTime.fromMillisecondsSinceEpoch(
+            1700000000000,
+          ).toUtc().toIso8601String(),
+        ]),
+      );
+      await a.handle(2, 'messages', {
+        'conversation': {'id': 'c'},
+        'before': 1700000000000,
+      });
+      expect(a.command, isNot(contains('--start')));
+      expect(a.command, contains('--end'));
+    },
+  );
+  test(
     'DingTalk group sender uses open ID and maps profile back to message ID',
     () async {
       final a = RecordingAdapter('dingtalk');

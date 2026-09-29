@@ -39,6 +39,8 @@ class Workspace extends ChangeNotifier {
 
   Conversation? selectedConversation;
   List<AccountRef> accounts = [];
+  Iterable<AccountRef> get visibleAccounts =>
+      accounts.where((a) => !a.signedOut);
   List<Conversation> conversations = [];
   List<Message> messages = [];
   int messageLimit = 100;
@@ -50,6 +52,13 @@ class Workspace extends ChangeNotifier {
   final _starting = <String, Future<RpcClient>>{};
   final sync = <String, SyncState>{};
   final authUrls = <String, String>{};
+  final deletedAccountIds = <String>{};
+  final activeAgentAccounts = <String>{};
+  final _deletingAccounts = <String>{};
+  int _eventsInFlight = 0;
+  bool isRemovingAccount(String id) =>
+      _deletingAccounts.contains(id) || deletedAccountIds.contains(id);
+  final _authorizations = <String, Completer<void>>{};
   final capabilities = <String, Json>{};
   final _busy = <String>{}, _updating = <String>{};
   final _backoff = <String, DateTime>{};
@@ -61,7 +70,11 @@ class Workspace extends ChangeNotifier {
   final _subscriptionFailures = <String, int>{};
 
   Future<void> recordDiagnostic(AccountRef a, Json input) async {
-    if (closing) return;
+    if (closing ||
+        deletedAccountIds.contains(a.id) ||
+        _deletingAccounts.contains(a.id)) {
+      return;
+    }
     final row = <String, dynamic>{
       'id': newId(),
       'accountId': a.id,
@@ -170,7 +183,7 @@ class Workspace extends ChangeNotifier {
   bool chatVisible = true;
   bool windowFocused = true;
   int get historyCutoff =>
-      DateTime.now().subtract(const Duration(days: 90)).millisecondsSinceEpoch;
+      DateTime.now().subtract(const Duration(days: 7)).millisecondsSinceEpoch;
   bool isReading(Conversation c) =>
       chatVisible && windowFocused && selectedConversation?.key == c.key;
   Timer? _timer;
@@ -179,6 +192,15 @@ class Workspace extends ChangeNotifier {
   VoidCallback? requestMessagesPage;
   AccountRef account(String id) => accounts.firstWhere((a) => a.id == id);
   void changed() {
+    final visibleIds = visibleAccounts.map((a) => a.id).toSet();
+    if (!visibleIds.contains(selectedAccount)) {
+      selectedAccount = visibleAccounts.firstOrNull?.id;
+    }
+    if (selectedConversation != null &&
+        !visibleIds.contains(selectedConversation!.accountId)) {
+      selectedConversation = null;
+      messages = [];
+    }
     if (!closing) notifyListeners();
   }
 
@@ -236,7 +258,7 @@ class Workspace extends ChangeNotifier {
       }
       await store.put('settings', 'seeded', {'version': 1});
       packages = await store.list('packages');
-      selectedAccount = accounts.firstOrNull?.id;
+      selectedAccount = visibleAccounts.firstOrNull?.id;
       outbox = await store.list('outbox');
       ready = true;
       _timer = Timer.periodic(const Duration(seconds: 1), (_) => tick());
@@ -265,6 +287,9 @@ class Workspace extends ChangeNotifier {
   }
 
   Future<RpcClient> client(AccountRef a) async {
+    if (deletedAccountIds.contains(a.id) || _deletingAccounts.contains(a.id)) {
+      throw const AppFailure('deleted', '账号正在清理或已删除');
+    }
     if (_updating.contains(a.platform)) {
       throw const AppFailure('updating', '插件正在更新');
     }
@@ -336,12 +361,26 @@ class Workspace extends ChangeNotifier {
   }
 
   Future<void> _event(AccountRef a, Json event) async {
+    if (isRemovingAccount(a.id)) return;
+    _eventsInFlight++;
+    try {
+      await _handleEvent(a, event);
+    } finally {
+      _eventsInFlight--;
+    }
+  }
+
+  Future<void> _handleEvent(AccountRef a, Json event) async {
+    if (deletedAccountIds.contains(a.id) || _deletingAccounts.contains(a.id)) {
+      return;
+    }
     if (closing) return;
     final params = object(event['params']);
     switch (event['method']) {
       case 'diagnostic':
         await recordDiagnostic(a, params);
       case 'auth.url':
+        if (!_authorizations.containsKey(a.id)) return;
         authUrls[a.id] = '${params['url']}';
         changed();
       case 'message':
@@ -417,6 +456,9 @@ class Workspace extends ChangeNotifier {
   }
 
   Future<void> saveAccount(AccountRef a) async {
+    if (isRemovingAccount(a.id)) {
+      throw const AppFailure('deleted', '账号正在清理或已删除');
+    }
     final index = accounts.indexWhere((x) => x.id == a.id);
     accounts[index] = a;
     await store.put('accounts', a.id, a.toJson());
@@ -433,16 +475,73 @@ class Workspace extends ChangeNotifier {
     AccountRef a, {
     bool configure = false,
     Json config = const {},
+    void Function(String stage)? onStage,
   }) async {
-    final rpc = await client(a);
-    if (configure) {
-      await rpc.call('auth.configure', config, const Duration(minutes: 6));
+    if (_authorizations.containsKey(a.id)) {
+      throw const AppFailure('busy', '授权正在进行');
     }
-    await rpc.call('auth.login', {}, const Duration(minutes: 6));
-    final result = object(await rpc.call('auth.status'));
+    final cancelled = Completer<void>();
+    _authorizations[a.id] = cancelled;
+    final cancellation = cancelled.future.then<Never>(
+      (_) => throw const AppFailure('cancelled', '授权已中止'),
+    );
+    Future<T> wait<T>(Future<T> operation) =>
+        Future.any([operation, cancellation]);
+    var stage = configure ? '应用初始化' : '用户授权';
+    void progress(String next) {
+      stage = next;
+      authUrls.remove(a.id);
+      onStage?.call(stage);
+      changed();
+    }
+
+    try {
+      progress(stage);
+      final rpc = await wait(client(a));
+      if (configure) {
+        await wait(
+          rpc.call('auth.configure', config, const Duration(minutes: 6)),
+        );
+        progress('用户授权');
+      }
+      final login = object(
+        await wait(rpc.call('auth.login', {}, const Duration(minutes: 6))),
+      );
+      progress('连接验证');
+      final result = object(await wait(rpc.call('auth.status')));
+      if (login['warning'] is String) {
+        notice = '${a.label}：${diagnosticText(login['warning'] as String)}';
+        result['warning'] = login['warning'];
+        result['missingScopes'] = login['missingScopes'];
+      }
+      return result;
+    } catch (e) {
+      if (cancelled.isCompleted) {
+        throw const AppFailure('cancelled', '授权已中止');
+      }
+      throw AppFailure(
+        e is AppFailure ? e.code : 'authorization',
+        '$stage失败：${diagnosticText(e is AppFailure ? e.message : '$e')}',
+        retryAfter: e is AppFailure ? e.retryAfter : null,
+      );
+    } finally {
+      _authorizations.remove(a.id);
+      authUrls.remove(a.id);
+      changed();
+    }
+  }
+
+  void cancelAuthentication(AccountRef a) {
+    final cancellation = _authorizations[a.id];
+    if (cancellation == null || cancellation.isCompleted) return;
+    cancellation.complete();
+    clients[a.id]?.cancelPending({
+      'auth.configure',
+      'auth.login',
+      'auth.status',
+    });
     authUrls.remove(a.id);
     changed();
-    return result;
   }
 
   Future<void> connect(
@@ -457,6 +556,7 @@ class Workspace extends ChangeNotifier {
       organization: organization,
       userId: userId,
       enabled: true,
+      signedOut: false,
     );
     await saveAccount(connected);
     await refreshConversations(connected);
@@ -464,15 +564,158 @@ class Workspace extends ChangeNotifier {
 
   Future<void> disconnect(AccountRef a, {bool logout = false}) async {
     await saveAccount(a.copyWith(enabled: false));
-    if (logout) {
-      final rpc = await client(a);
-      await rpc.call('auth.logout');
+    try {
+      if (logout) {
+        final rpc = await client(a);
+        await rpc.call('auth.logout');
+        await saveAccount(
+          account(a.id).copyWith(signedOut: true, enabled: false),
+        );
+      }
+    } finally {
+      try {
+        await clients.remove(a.id)?.close();
+      } finally {
+        for (final c in conversations.where((c) => c.accountId == a.id)) {
+          _streams.remove(c.key);
+        }
+        authUrls.remove(a.id);
+        changed();
+      }
     }
-    await clients.remove(a.id)?.close();
-    for (final c in conversations.where((c) => c.accountId == a.id)) {
-      _streams.remove(c.key);
+  }
+
+  Future<void> deleteAccount(AccountRef a, {bool logout = true}) async {
+    if (_updating.isNotEmpty ||
+        activeAgentAccounts.contains(a.id) ||
+        _authorizations.containsKey(a.id) ||
+        _starting.isNotEmpty ||
+        _deletingAccounts.isNotEmpty) {
+      throw const AppFailure('busy', '请先结束授权、Agent 任务或插件更新，再清理账号');
     }
-    changed();
+    // Stop scheduling this account before waiting for outstanding work.
+    await saveAccount(account(a.id).copyWith(enabled: false));
+    if (logout && !account(a.id).signedOut) {
+      await disconnect(account(a.id), logout: true);
+    }
+    if (!_deletingAccounts.add(a.id)) throw const AppFailure('busy', '账号正在清理');
+    try {
+      await clients.remove(a.id)?.close();
+      final deadline = DateTime.now().add(const Duration(seconds: 5));
+      while (_eventsInFlight > 0 ||
+          _busy.isNotEmpty ||
+          activities.runningCount > 0 ||
+          (_sendingAccounts[a.id] ?? 0) > 0) {
+        if (DateTime.now().isAfter(deadline)) {
+          throw const AppFailure('busy', '后台任务尚未结束，账号已暂停，请稍后重试清理');
+        }
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+      }
+      if (activeAgentAccounts.contains(a.id)) {
+        throw const AppFailure('busy', '请先结束此账号的 Agent 任务');
+      }
+      for (final segment in [a.id, a.platform]) {
+        if (segment.isEmpty ||
+            segment == '.' ||
+            segment == '..' ||
+            p.basename(segment) != segment) {
+          throw const AppFailure('path', '账号数据路径无效');
+        }
+      }
+      await _deleteAccountPath(p.join(root, 'accounts', a.id));
+      final backupRoot = p.join(root, 'backups', a.platform);
+      await _checkAccountPath(backupRoot);
+      if (await FileSystemEntity.type(backupRoot, followLinks: false) ==
+          FileSystemEntityType.link) {
+        throw const AppFailure('path', '备份目录是符号链接，无法安全清理');
+      }
+      if (await FileSystemEntity.type(backupRoot, followLinks: false) ==
+          FileSystemEntityType.directory) {
+        await for (final version in Directory(
+          backupRoot,
+        ).list(followLinks: false)) {
+          if (version is Directory) {
+            await _deleteAccountPath(p.join(version.path, a.id));
+          }
+        }
+      }
+      await store.deleteAccount(a.id);
+      deletedAccountIds.add(a.id);
+      final keys = conversations
+          .where((c) => c.accountId == a.id)
+          .map((c) => c.key)
+          .toSet();
+      bool ownedKey(String key) {
+        if (keys.contains(key) || key == a.id || key.endsWith(':${a.id}')) {
+          return true;
+        }
+        try {
+          final parts = jsonDecode(key);
+          if (parts is List && parts.isNotEmpty && parts.first is String) {
+            return parts.first == a.id || ownedKey(parts.first as String);
+          }
+        } catch (_) {}
+        return false;
+      }
+
+      accounts.removeWhere((v) => v.id == a.id);
+      conversations.removeWhere((v) => v.accountId == a.id);
+      messages.removeWhere((v) => v.accountId == a.id);
+      outbox.removeWhere((v) => v['accountId'] == a.id);
+      diagnostics.removeWhere((v) => v['accountId'] == a.id);
+      for (final map in <Map<String, dynamic>>[
+        sync,
+        authUrls,
+        capabilities,
+        _backoff,
+        _next,
+        _subscriptionRetry,
+        _subscriptionFailures,
+        senderProfiles,
+        _readAt,
+        _seenPlatformTime,
+        _attachments,
+      ]) {
+        map.removeWhere((key, _) => ownedKey(key));
+      }
+      for (final set in [_streams, blockedConversations, _historyDone]) {
+        set.removeWhere(ownedKey);
+      }
+      _senderQueue.remove(a.id);
+      _sendingAccounts.remove(a.id);
+      activities.removeScope(a.label);
+      notices.removeWhere((notice) => notice.contains(a.label));
+    } finally {
+      _deletingAccounts.remove(a.id);
+      changed();
+    }
+  }
+
+  Future<void> _checkAccountPath(String path) async {
+    final base = p.normalize(p.absolute(root));
+    final target = p.normalize(p.absolute(path));
+    if (!p.isWithin(base, target)) throw const AppFailure('path', '清理路径超出工作区');
+    var current = base;
+    for (final part in p.split(p.relative(p.dirname(target), from: base))) {
+      if (part == '.') continue;
+      current = p.join(current, part);
+      if (await FileSystemEntity.type(current, followLinks: false) ==
+          FileSystemEntityType.link) {
+        throw const AppFailure('path', '账号目录的父路径包含符号链接，无法安全清理');
+      }
+    }
+  }
+
+  Future<void> _deleteAccountPath(String path) async {
+    await _checkAccountPath(path);
+    final type = await FileSystemEntity.type(path, followLinks: false);
+    if (type == FileSystemEntityType.directory) {
+      await Directory(path).delete(recursive: true);
+    } else if (type == FileSystemEntityType.link) {
+      await Link(path).delete();
+    } else if (type == FileSystemEntityType.file) {
+      await File(path).delete();
+    }
   }
 
   Future<void> refreshConversations(AccountRef a, {bool more = false}) =>
@@ -594,6 +837,10 @@ class Workspace extends ChangeNotifier {
   }
 
   void _upsertConversation(Conversation c) {
+    if (deletedAccountIds.contains(c.accountId) ||
+        _deletingAccounts.contains(c.accountId)) {
+      return;
+    }
     final index = conversations.indexWhere((x) => x.key == c.key);
     if (index < 0) {
       conversations.add(c);
@@ -609,15 +856,19 @@ class Workspace extends ChangeNotifier {
     }
   }
 
-  Future<void> showEarlierMessages() async {
+  Future<void> showEarlierMessages({bool manual = false}) async {
     final c = selectedConversation;
     if (c == null || loadingEarlier) return;
     loadingEarlier = true;
     try {
       messageLimit += 100;
       await loadMessages();
-      if (messages.length < messageLimit && !_historyDone.contains(c.key)) {
-        await syncConversation(c, older: true);
+      final saved = await store.get('cursors', c.key);
+      final done = manual
+          ? (saved?['manualHistoryDone'] == true)
+          : _historyDone.contains(c.key);
+      if (messages.length < messageLimit && !done) {
+        await syncConversation(c, older: true, manual: manual);
       }
     } finally {
       loadingEarlier = false;
@@ -812,7 +1063,11 @@ class Workspace extends ChangeNotifier {
     }
   });
 
-  Future<void> syncConversation(Conversation c, {bool older = false}) async {
+  Future<void> syncConversation(
+    Conversation c, {
+    bool older = false,
+    bool manual = false,
+  }) async {
     if (blockedConversations.contains(c.key) || !_busy.add(c.key)) return;
     final state = sync[c.key] ??= SyncState();
     BackgroundActivity? activity;
@@ -828,6 +1083,11 @@ class Workspace extends ChangeNotifier {
       activity.progress('正在请求消息');
       final rpc = await client(a);
       final saved = await store.get('cursors', c.key);
+      final initial =
+          saved?['timestamp'] == null && saved?['resumeSince'] == null;
+      final cutoff = (saved?['historyWindowStart'] as int?) ?? historyCutoff;
+      final limitHistory = !manual && (older || initial);
+      final historyPrefix = manual ? 'manualHistory' : 'history';
       final requestStartedAt = DateTime.now().millisecondsSinceEpoch;
       int? before;
       if (older) before = await store.oldestMessage(a.id, c.id);
@@ -835,9 +1095,17 @@ class Workspace extends ChangeNotifier {
           ? null
           : (saved?['resumeSince'] ?? saved?['timestamp']) as int?;
       String? cursor = older
-          ? (saved?['historyCursor'] as String?)
+          ? (saved?['${historyPrefix}Cursor'] as String?)
           : (saved?['resumeCursor'] as String?);
-      if (older && cursor != null) before = saved?['historyBefore'] as int?;
+      if (older && cursor != null) {
+        before = saved?['${historyPrefix}Before'] as int?;
+      }
+      if (older && limitHistory && before != null && before <= cutoff) {
+        _historyDone.add(c.key);
+        await store.put('cursors', c.key, {...?saved, 'historyDone': true});
+        activity.finish(state: 'completed', detail: '已达到自动拉取的 7 天范围');
+        return;
+      }
       var pages = 0, hasMore = false, stalledIncrement = false;
       var maxTime = (saved?['resumeMaxTime'] as int?) ?? since ?? 0;
       int? pageOldest;
@@ -848,6 +1116,7 @@ class Workspace extends ChangeNotifier {
             'before': ?before,
             if (since != null) 'since': since - 2000,
             'cursor': ?cursor,
+            if (limitHistory) 'notBefore': cutoff,
           }),
         );
         final items = (result['items'] as List? ?? [])
@@ -860,7 +1129,7 @@ class Workspace extends ChangeNotifier {
           if (pageOldest == null || m.timestamp < pageOldest) {
             pageOldest = m.timestamp;
           }
-          if (older && m.timestamp < historyCutoff) continue;
+          if (limitHistory && m.timestamp < cutoff) continue;
           final existed = !await store.saveIncoming(m);
           if (!existed && m.timestamp >= historyCutoff) {
             await _incrementUnread(m);
@@ -901,23 +1170,25 @@ class Workspace extends ChangeNotifier {
           (_sendingAccounts[a.id] ?? 0) == 0);
       if (!older) state.gap = since != null && hasMore;
       final checkpoint = <String, dynamic>{...?saved};
+      if (limitHistory) checkpoint['historyWindowStart'] = cutoff;
       if (older) {
-        checkpoint['historyCursor'] = cursor;
-        checkpoint['historyBefore'] = before;
+        checkpoint['${historyPrefix}Cursor'] = cursor;
+        checkpoint['${historyPrefix}Before'] = before;
         final reachedEnd =
-            !hasMore || (pageOldest != null && pageOldest <= historyCutoff);
+            !hasMore ||
+            (limitHistory && pageOldest != null && pageOldest <= cutoff);
         final stalled =
             hasMore &&
             cursor == null &&
             (pageOldest == null || (before != null && pageOldest >= before));
         if (reachedEnd || stalled) {
-          _historyDone.add(c.key);
-          checkpoint['historyDone'] = true;
-          checkpoint['historyIncomplete'] = stalled;
+          if (!manual) _historyDone.add(c.key);
+          checkpoint['${historyPrefix}Done'] = true;
+          checkpoint['${historyPrefix}Incomplete'] = stalled;
         }
       } else {
         if (saved?['timestamp'] == null && saved?['resumeSince'] == null) {
-          if (!hasMore) {
+          if (!hasMore || (pageOldest != null && pageOldest <= cutoff)) {
             _historyDone.add(c.key);
             checkpoint['historyDone'] = true;
           } else if (cursor != null) {
@@ -940,7 +1211,7 @@ class Workspace extends ChangeNotifier {
           ? '增量分页无法继续，稍后重试；消息可能不完整'
           : state.gap
           ? '消息有缺口，正在自动补齐'
-          : checkpoint['historyIncomplete'] == true
+          : checkpoint['${historyPrefix}Incomplete'] == true
           ? '历史分页边界无法继续，部分历史可能不完整'
           : '';
       state.lastSuccess = DateTime.now().millisecondsSinceEpoch;
@@ -1019,7 +1290,7 @@ class Workspace extends ChangeNotifier {
       .length;
 
   void tick({DateTime? at}) {
-    if (closing) return;
+    if (closing || _deletingAccounts.isNotEmpty) return;
     final now = at ?? DateTime.now();
     bool due(String key) =>
         !(_next[key]?.isAfter(now) ?? false) &&
@@ -1345,6 +1616,9 @@ class Workspace extends ChangeNotifier {
     Json release,
     void Function(String) progress,
   ) async {
+    if (_deletingAccounts.isNotEmpty) {
+      throw const AppFailure('busy', '正在清理账号，请稍后更新插件');
+    }
     if (!_updating.add(id)) throw const AppFailure('busy', '插件正在更新');
     final backupId = newId();
     final backups = <String, String>{};
@@ -1384,6 +1658,9 @@ class Workspace extends ChangeNotifier {
   }
 
   Future<void> rollbackPlugin(String id) async {
+    if (_deletingAccounts.isNotEmpty) {
+      throw const AppFailure('busy', '正在清理账号，请稍后回滚插件');
+    }
     if (!_updating.add(id)) throw const AppFailure('busy', '插件正在更新');
     try {
       final current = await plugins.installation(id);

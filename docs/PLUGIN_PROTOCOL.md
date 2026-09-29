@@ -20,7 +20,7 @@
 | auth.login | 无 | completed；过程中通知 auth.url |
 | auth.status / auth.logout | 无 | 状态 / 空对象 |
 | conversations | 可选 cursor | items: Conversation[]、cursor |
-| messages | conversation、可选 before/since（毫秒）/cursor | items: Message[]、cursor、hasMore |
+| messages | conversation、可选 before/since/notBefore（毫秒）/cursor；notBefore 是自动初始化历史的下限，不改变倒序分页方向 | items: Message[]、cursor、hasMore |
 | send | conversation、text、reply、attachment、image、markdown、idempotencyKey、approved | result、messageId |
 | contacts / conversation.open | query / contact | items / Conversation |
 | contacts.resolve | ids（最多 20 个平台用户 ID）、可选 conversation、openIds（查询 ID → 钉钉 openDingTalkId） | items: {id, name, avatar, avatarResourceId?}[]；头像资源由宿主通过 attachment.download 下载到账号缓存，缺权限时降级为消息自带身份 |

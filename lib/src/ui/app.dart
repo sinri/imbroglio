@@ -259,7 +259,7 @@ class _WorkspaceShellState extends ConsumerState<WorkspaceShell> {
                   child: IndexedStack(
                     index: page,
                     children: [
-                      MessagesPage(onSetup: () => setState(() => page = 3)),
+                      MessagesPage(onSetup: () => setState(() => page = 4)),
                       SearchPage(onMessage: () => setState(() => page = 0)),
                       const AgentPage(),
                       const PluginsPage(),

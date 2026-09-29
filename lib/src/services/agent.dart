@@ -118,7 +118,21 @@ Stream<String> sseData(Stream<List<int>> bytes) async* {
 
 class AgentController extends ChangeNotifier {
   final Workspace workspace;
-  AgentController(this.workspace);
+  AgentController(this.workspace) {
+    workspace.addListener(_accountsChanged);
+  }
+
+  void _accountsChanged() {
+    if (!running &&
+        (sessionScope?.any(workspace.deletedAccountIds.contains) == true ||
+            sources.values.any(
+              (r) => workspace.deletedAccountIds.contains(r.accountId),
+            ))) {
+      pendingErrors.clear();
+      newSession();
+    }
+  }
+
   String sessionId = newId();
   List<Json> history = [];
   final sources = <String, ResourceRef>{};
@@ -193,6 +207,10 @@ class AgentController extends ChangeNotifier {
   }, ts: DateTime.now().millisecondsSinceEpoch);
   Future<void> run(String prompt, Set<String> scope, Json plugin) async {
     if (running || prompt.trim().isEmpty) return;
+    if (scope.any(workspace.isRemovingAccount)) {
+      throw const AppFailure('deleted', '账号已删除，请重新选择账号');
+    }
+    workspace.activeAgentAccounts.addAll(scope);
     running = true;
     cancelled = false;
     error = '';
@@ -346,7 +364,11 @@ class AgentController extends ChangeNotifier {
       running = false;
       streaming = '';
       gate.clear();
-      await _save();
+      try {
+        await _save();
+      } finally {
+        workspace.activeAgentAccounts.removeAll(scope);
+      }
       notifyListeners();
     }
   }
@@ -492,6 +514,7 @@ class AgentController extends ChangeNotifier {
 
   @override
   void dispose() {
+    workspace.removeListener(_accountsChanged);
     cancel();
     super.dispose();
   }

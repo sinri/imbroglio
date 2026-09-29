@@ -9,6 +9,8 @@ import '../lib/src/core/models.dart';
 import '../lib/src/core/normalize.dart';
 // ignore: avoid_relative_lib_imports
 import '../lib/src/core/diagnostics.dart';
+// ignore: avoid_relative_lib_imports
+import '../lib/src/core/cli_failure.dart';
 
 void emit(Json j) => stdout.writeln(jsonEncode({'jsonrpc': '2.0', ...j}));
 
@@ -16,6 +18,20 @@ class Adapter {
   late String platform, binary, directory, accountId;
   String profile = '';
   final processes = <Object, Process>{};
+  final _running = <Object>{}, _cancelled = <Object>{};
+  final _killTimers = <Object, Timer>{};
+  void cancel(Object id) {
+    if (!_running.contains(id)) return;
+    _cancelled.add(id);
+    final child = processes[id];
+    if (child == null) return; // Process.start is still pending.
+    child.kill();
+    _killTimers[id]?.cancel();
+    _killTimers[id] = Timer(const Duration(seconds: 1), () {
+      if (identical(processes[id], child)) child.kill(ProcessSignal.sigkill);
+    });
+  }
+
   final streams = <String, Process>{};
   final capabilities = <String, dynamic>{};
   bool initialized = false;
@@ -86,34 +102,55 @@ class Adapter {
     Duration timeout = const Duration(seconds: 40),
     bool auth = false,
   }) async {
-    final process = await Process.start(
-      binary,
-      args,
-      workingDirectory: directory,
-      environment: environment,
-      includeParentEnvironment: false,
-      runInShell: false,
-    );
+    _running.add(id);
+    late Process process;
+    try {
+      process = await Process.start(
+        binary,
+        args,
+        workingDirectory: directory,
+        environment: environment,
+        includeParentEnvironment: false,
+        runInShell: false,
+      );
+    } catch (_) {
+      _running.remove(id);
+      _cancelled.remove(id);
+      rethrow;
+    }
     processes[id] = process;
+    if (_cancelled.contains(id)) cancel(id);
     final buffer = StringBuffer(), errors = StringBuffer();
+    final emittedAuthUrls = <String>{};
     void capture(String data, StringBuffer target) {
       if (target.length + data.length > 8 * 1024 * 1024) {
         process.kill();
         return;
       }
       target.write(data);
-      if (auth) {
-        for (final match in RegExp(
-          r'https://[^\s"<>]+(?=[\s"<>])',
-        ).allMatches(target.toString())) {
-          final url = match.group(0)!;
+      if (auth && !_cancelled.contains(id)) {
+        final jsonLogin =
+            platform == 'feishu' &&
+            args.length >= 2 &&
+            args[0] == 'auth' &&
+            args[1] == 'login' &&
+            args.contains('--json');
+        final urls = jsonLogin
+            ? cliJsonDocuments(target.toString())
+                  .where((j) => j['event'] == 'device_authorization')
+                  .map((j) => '${j['verification_uri_complete'] ?? ''}')
+            : RegExp(
+                r'https://[^\s"<>]+(?=[\s"<>])',
+              ).allMatches(target.toString()).map((m) => m.group(0)!);
+        for (final url in urls) {
           final host = Uri.tryParse(url)?.host ?? '';
           if ([
-            'dingtalk.com',
-            'feishu.cn',
-            'larksuite.com',
-            'larkoffice.com',
-          ].any((d) => host == d || host.endsWith('.$d'))) {
+                'dingtalk.com',
+                'feishu.cn',
+                'larksuite.com',
+                'larkoffice.com',
+              ].any((d) => host == d || host.endsWith('.$d')) &&
+              emittedAuthUrls.add(url)) {
             emit({
               'method': 'auth.url',
               'params': {'url': url},
@@ -129,33 +166,34 @@ class Adapter {
     final err = process.stderr
         .transform(utf8.decoder)
         .forEach((s) => capture(s, errors));
-    if (input != null) process.stdin.write(input);
-    await process.stdin.close();
     int? exitCode;
     try {
+      if (input != null) process.stdin.write(input);
+      await process.stdin.close();
       final code = await process.exitCode.timeout(timeout);
       exitCode = code;
       await out;
       await err;
+      if (_cancelled.contains(id)) {
+        throw const AppFailure('cancelled', '授权已中止');
+      }
       if (code != 0) {
-        var message = 'CLI 请求失败 ($code)';
-        String kind = 'upstream';
-        int? retryAfter;
-        try {
-          final j = object(jsonDecode(errors.toString()));
-          final e = object(j['error']);
-          message =
-              '${e['message'] ?? j['message'] ?? j['errorMsg'] ?? message}';
-          kind = '${e['type'] ?? kind}';
-          retryAfter = int.tryParse(
-            '${e['retry_after'] ?? e['retryAfter'] ?? j['retry_after']}',
-          );
-          if (e['code'] == 429 || e['subtype'] == 'rate_limit') {
-            kind = 'rate_limit';
-          }
-        } catch (_) {}
-        if (code == 10) kind = 'confirmation';
-        throw AppFailure(kind, message, retryAfter: retryAfter);
+        final completion = cliJsonDocuments(buffer.toString()).lastOrNull;
+        final partialLogin =
+            platform == 'feishu' &&
+            args.length >= 2 &&
+            args[0] == 'auth' &&
+            args[1] == 'login' &&
+            args.contains('--json') &&
+            code == 3 &&
+            completion?['event'] == 'authorization_complete' &&
+            '${completion?['user_open_id'] ?? ''}'.isNotEmpty &&
+            object(completion?['warning'])['type'] == 'missing_scope' &&
+            completion?['missing'] is List &&
+            (completion!['missing'] as List).isNotEmpty;
+        if (!partialLogin) {
+          throw cliFailure(code, errors.toString(), buffer.toString());
+        }
       }
       if (raw) return buffer.toString();
       try {
@@ -173,6 +211,9 @@ class Adapter {
       );
       throw const AppFailure('timeout', 'CLI 超时；写入结果未知');
     } catch (e) {
+      if (_cancelled.contains(id)) {
+        throw const AppFailure('cancelled', '授权已中止');
+      }
       diagnostic(
         args.take(2).join(' '),
         '$e\n${errors.toString()}',
@@ -184,6 +225,9 @@ class Adapter {
       rethrow;
     } finally {
       processes.remove(id);
+      _running.remove(id);
+      _cancelled.remove(id);
+      _killTimers.remove(id)?.cancel();
     }
   }
 
@@ -285,15 +329,31 @@ class Adapter {
         }
         return {'configured': true};
       case 'auth.login':
-        await run(
+        final loginOutput = await run(
           id,
           platform == 'dingtalk'
               ? ['auth', 'login', '--no-browser']
-              : ['auth', 'login', '--recommend'],
+              : ['auth', 'login', '--recommend', '--json'],
           raw: true,
           auth: true,
           timeout: const Duration(minutes: 5),
         );
+        if (platform == 'feishu') {
+          final completion = cliJsonDocuments('$loginOutput').lastOrNull;
+          if (completion?['event'] != 'authorization_complete' ||
+              '${completion?['user_open_id'] ?? ''}'.isEmpty) {
+            throw const AppFailure('contract', '飞书 CLI 未返回登录完成结果');
+          }
+          final missing = completion?['missing'];
+          return {
+            'completed': true,
+            'userId': completion!['user_open_id'],
+            if (missing is List && missing.isNotEmpty) ...{
+              'missingScopes': missing,
+              'warning': '已完成登录，但有 ${missing.length} 项权限未授予，相关功能暂不可用。',
+            },
+          };
+        }
         return {'completed': true};
       case 'auth.status':
         final value = await run(
@@ -388,6 +448,11 @@ class Adapter {
                 if (args['since'] != null) ...[
                   '--start',
                   time.toUtc().toIso8601String(),
+                ] else if (args['notBefore'] != null) ...[
+                  '--start',
+                  DateTime.fromMillisecondsSinceEpoch(
+                    args['notBefore'] as int,
+                  ).toUtc().toIso8601String(),
                 ],
                 if (older) ...['--end', time.toUtc().toIso8601String()],
                 if (args['cursor'] != null) ...['--page-token', args['cursor']],
@@ -1000,7 +1065,7 @@ Future<void> main() async {
     final method = '${request['method']}';
     final args = object(request['params']);
     if (method == 'cancel') {
-      adapter.processes[args['id']]?.kill();
+      if (args['id'] != null) adapter.cancel(args['id']);
       continue;
     }
     final id = request['id'] ?? newId();

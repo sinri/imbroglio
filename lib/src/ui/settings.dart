@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'package:crypto/crypto.dart';
@@ -158,15 +159,6 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
                           padding: EdgeInsets.only(top: 12),
                           child: LinearProgressIndicator(),
                         ),
-                      const SizedBox(height: 12),
-                      OutlinedButton.icon(
-                        onPressed:
-                            install == null || install['enabled'] == false
-                            ? null
-                            : () => accountDialog(context, ref, id),
-                        icon: const Icon(Icons.person_add_alt, size: 18),
-                        label: const Text('连接账号'),
-                      ),
                     ],
                   ),
                 ),
@@ -192,13 +184,6 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
               ),
               trailing: Wrap(
                 children: [
-                  if (plugin['kind'] == 'im')
-                    IconButton(
-                      tooltip: '连接账号',
-                      onPressed: () =>
-                          accountDialog(context, ref, plugin['id']),
-                      icon: const Icon(Icons.person_add_alt),
-                    ),
                   Switch(
                     value: plugin['enabled'] == true,
                     onChanged: (value) => guarded(context, () async {
@@ -233,7 +218,7 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
         ),
         const SizedBox(height: 20),
         const Text(
-          '配置与缓存独立保存。系统凭证可能共享；相同账号的授权和退出可能影响系统 CLI。',
+          '安装完成后，请前往「设置 → 账号与授权」连接和管理账号。',
           style: TextStyle(fontSize: 12),
         ),
       ],
@@ -298,6 +283,9 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
       model = TextEditingController(),
       key = TextEditingController();
   bool loaded = false, saving = false;
+  final exitingAccounts = <String>{};
+  final cleaningAccounts = <String>{};
+  final _sourceQueries = <String, ({Object version, Future<Json?> future})>{};
   @override
   void initState() {
     super.initState();
@@ -332,67 +320,17 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
       children: [
         Text('账号与授权', style: Theme.of(context).textTheme.headlineSmall),
         const SizedBox(height: 12),
-        if (w.accounts.isEmpty)
-          const ListTile(
-            title: Text('尚未连接账号'),
-            subtitle: Text('请先在插件中心安装钉钉或飞书连接器。'),
-          ),
-        ...w.accounts.map(
-          (a) => Card(
-            child: ListTile(
-              contentPadding: const EdgeInsets.all(16),
-              leading: Icon(
-                a.platform == 'dingtalk' ? Icons.bolt : Icons.flight,
-              ),
-              title: Text(a.label),
-              subtitle: Text(
-                '${a.platform} · ${a.organization.isEmpty ? a.profile : a.organization} · ${a.enabled ? '同步已开启' : '未连接 / 已暂停'}',
-              ),
-              trailing: Wrap(
-                spacing: 8,
-                children: [
-                  TextButton(
-                    onPressed: () => renameAccountDialog(context, ref, a),
-                    child: const Text('改名'),
-                  ),
-                  TextButton(
-                    onPressed: () =>
-                        accountDialog(context, ref, a.platform, existing: a),
-                    child: const Text('授权'),
-                  ),
-                  TextButton(
-                    onPressed: () => guarded(context, () async {
-                      if (a.enabled) {
-                        await w.disconnect(a);
-                      } else {
-                        await w.connect(
-                          a,
-                          profile: a.profile,
-                          organization: a.organization,
-                          userId: a.userId,
-                        );
-                      }
-                    }),
-                    child: Text(a.enabled ? '暂停' : '恢复'),
-                  ),
-                  IconButton(
-                    tooltip: '退出账号',
-                    onPressed: () => guarded(context, () async {
-                      if (await confirm(
-                        context,
-                        '退出 ${a.label}',
-                        '系统凭证可能共享。退出此账号可能同时影响系统 CLI 的登录态，是否继续？',
-                      )) {
-                        await w.disconnect(a, logout: true);
-                      }
-                    }),
-                    icon: const Icon(Icons.logout, size: 20),
-                  ),
-                ],
-              ),
-            ),
-          ),
-        ),
+        const Text('按 IM 来源连接账号，管理授权、名称和同步状态。'),
+        const SizedBox(height: 16),
+        for (final platform in {
+          'dingtalk',
+          'feishu',
+          ...w.packages
+              .where((p) => p['kind'] == 'im')
+              .map((p) => p['id'] as String),
+          ...w.accounts.map((a) => a.platform),
+        })
+          accountSource(platform),
         const SizedBox(height: 30),
         Text('模型服务', style: Theme.of(context).textTheme.headlineSmall),
         const SizedBox(height: 8),
@@ -455,6 +393,316 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
         ),
       ],
     );
+  }
+
+  Widget accountSource(String platform) {
+    final w = ref.read(workspaceProvider);
+    final builtin = platform == 'dingtalk' || platform == 'feishu';
+    final package = w.packages
+        .where((p) => p['kind'] == 'im' && p['id'] == platform)
+        .firstOrNull;
+    final name = platform == 'dingtalk'
+        ? '钉钉'
+        : platform == 'feishu'
+        ? '飞书'
+        : '${package?['name'] ?? platform}';
+    final accounts = w.visibleAccounts
+        .where((a) => a.platform == platform)
+        .toList();
+    final Object version = builtin
+        ? (w.store, w.store.revision('installations'))
+        : jsonEncode(package);
+    var query = _sourceQueries[platform];
+    if (query == null || query.version != version) {
+      query = (
+        version: version,
+        future: builtin
+            ? w.store.get('installations', platform)
+            : Future<Json?>.value(package),
+      );
+      _sourceQueries[platform] = query;
+    }
+    final archived = w.accounts
+        .where((a) => a.platform == platform && a.signedOut)
+        .toList();
+    return FutureBuilder<Json?>(
+      future: query.future,
+      builder: (context, snapshot) {
+        final installation = snapshot.data;
+        final available =
+            snapshot.connectionState == ConnectionState.done &&
+            !snapshot.hasError &&
+            installation != null &&
+            (builtin
+                ? installation['enabled'] != false
+                : installation['enabled'] == true);
+        final status = snapshot.hasError
+            ? '无法读取插件状态，请重新进入设置'
+            : snapshot.connectionState != ConnectionState.done
+            ? '正在读取插件状态…'
+            : installation == null
+            ? '尚未安装插件，请前往插件中心安装'
+            : !available
+            ? '插件已停用，请前往插件中心启用'
+            : '插件已就绪';
+        return Card(
+          key: ValueKey('account-source:$platform'),
+          margin: const EdgeInsets.only(bottom: 16),
+          child: Padding(
+            padding: const EdgeInsets.all(20),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Icon(
+                      platform == 'dingtalk'
+                          ? Icons.bolt
+                          : platform == 'feishu'
+                          ? Icons.flight
+                          : Icons.extension_outlined,
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            '$name · ${accounts.length} 个账号',
+                            style: Theme.of(context).textTheme.titleMedium,
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            status,
+                            style: Theme.of(context).textTheme.bodySmall,
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    OutlinedButton.icon(
+                      key: ValueKey('add-account:$platform'),
+                      onPressed: available
+                          ? () => accountDialog(context, ref, platform)
+                          : null,
+                      icon: const Icon(Icons.person_add_alt, size: 18),
+                      label: const Text('添加账号'),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                if (w.accounts.any(
+                  (a) =>
+                      a.platform == platform && cleaningAccounts.contains(a.id),
+                )) ...[
+                  const LinearProgressIndicator(),
+                  const SizedBox(height: 8),
+                  const Text('正在清理本地数据…'),
+                ],
+                if (accounts.isEmpty)
+                  const Padding(
+                    padding: EdgeInsets.symmetric(vertical: 8),
+                    child: Text('尚未连接账号'),
+                  ),
+                for (final a in accounts) accountTile(a, available: available),
+                if (archived.isNotEmpty)
+                  ExpansionTile(
+                    key: ValueKey('archived-accounts:$platform'),
+                    title: Text('已退出账号的本地数据（${archived.length}）'),
+                    subtitle: const Text('这些账号已退出，仅保留本地记录，可在此清理。'),
+                    children: [
+                      for (final a in archived)
+                        ListTile(
+                          title: Text(a.label),
+                          trailing: TextButton.icon(
+                            onPressed: exitingAccounts.contains(a.id)
+                                ? null
+                                : () => deleteAccountDialog(a),
+                            icon: const Icon(Icons.delete_forever_outlined),
+                            label: const Text('清理本地数据'),
+                          ),
+                        ),
+                    ],
+                  ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget accountTile(AccountRef a, {required bool available}) {
+    final w = ref.read(workspaceProvider);
+    return Card(
+      child: ListTile(
+        contentPadding: const EdgeInsets.all(16),
+        leading: Icon(a.platform == 'dingtalk' ? Icons.bolt : Icons.flight),
+        title: Text(a.label),
+        subtitle: Text(
+          '${a.organization.isEmpty ? a.profile : a.organization} · ${a.enabled ? '同步已开启' : '未连接 / 已暂停'}',
+        ),
+        trailing: Wrap(
+          spacing: 8,
+          children: [
+            TextButton(
+              onPressed: exitingAccounts.contains(a.id)
+                  ? null
+                  : () => renameAccountDialog(context, ref, a),
+              child: const Text('改名'),
+            ),
+            TextButton(
+              onPressed: exitingAccounts.contains(a.id) || !available
+                  ? null
+                  : () => accountDialog(context, ref, a.platform, existing: a),
+              child: const Text('授权'),
+            ),
+            if (!a.signedOut)
+              TextButton(
+                onPressed:
+                    exitingAccounts.contains(a.id) || (!a.enabled && !available)
+                    ? null
+                    : () => guarded(context, () async {
+                        if (a.enabled) {
+                          await w.disconnect(a);
+                        } else {
+                          await w.connect(
+                            a,
+                            profile: a.profile,
+                            organization: a.organization,
+                            userId: a.userId,
+                          );
+                        }
+                      }),
+                child: Text(a.enabled ? '暂停' : '恢复'),
+              ),
+            IconButton(
+              tooltip: '删除账号及本地数据',
+              onPressed: exitingAccounts.contains(a.id)
+                  ? null
+                  : () => deleteAccountDialog(a),
+              icon: const Icon(Icons.delete_forever_outlined, size: 20),
+            ),
+            IconButton(
+              tooltip: cleaningAccounts.contains(a.id)
+                  ? '正在清理本地数据'
+                  : exitingAccounts.contains(a.id)
+                  ? '正在退出账号'
+                  : '退出账号',
+              onPressed: exitingAccounts.contains(a.id) || a.signedOut
+                  ? null
+                  : () => guarded(context, () async {
+                      if (await confirm(
+                        context,
+                        '退出 ${a.label}',
+                        '系统凭证可能共享。退出此账号可能同时影响系统 CLI 的登录态，是否继续？',
+                      )) {
+                        if (!mounted) return;
+                        setState(() => exitingAccounts.add(a.id));
+                        try {
+                          await w.disconnect(a, logout: true);
+                          if (mounted) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              SnackBar(content: Text('已退出 ${a.label}')),
+                            );
+                          }
+                        } finally {
+                          if (mounted) {
+                            setState(() => exitingAccounts.remove(a.id));
+                          }
+                        }
+                      }
+                    }),
+              icon: exitingAccounts.contains(a.id)
+                  ? const SizedBox(
+                      width: 20,
+                      height: 20,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.logout, size: 20),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> deleteAccountDialog(AccountRef a) async {
+    var logout = !a.signedOut;
+    final confirmed =
+        await showDialog<bool>(
+          context: context,
+          builder: (dialogContext) => StatefulBuilder(
+            builder: (dialogContext, set) => AlertDialog(
+              title: Text('彻底清理 ${a.label}'),
+              content: SizedBox(
+                width: 520,
+                child: SingleChildScrollView(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text(
+                        '将删除此账号在本应用中的账号资料、聊天记录与索引、附件和头像、同步及发送记录、配置和备份。涉及此账号的整个 Agent 会话也会删除，包括其中其他账号的内容。此操作无法撤销。',
+                      ),
+                      const SizedBox(height: 12),
+                      const Text('不会删除云端消息、已导出到其他位置的文件或其他账号的独立数据。'),
+                      if (!a.signedOut) ...[
+                        const SizedBox(height: 12),
+                        CheckboxListTile(
+                          contentPadding: EdgeInsets.zero,
+                          title: const Text('同时注销登录'),
+                          subtitle: const Text(
+                            '系统凭证可能共享，注销可能影响系统 CLI。插件不可用时，可取消勾选，仅清理本地数据。',
+                          ),
+                          value: logout,
+                          onChanged: (value) => set(() => logout = value!),
+                        ),
+                        if (!logout) const Text('仅清理本地数据不会注销登录或撤销服务端授权。'),
+                      ],
+                    ],
+                  ),
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(dialogContext, false),
+                  child: const Text('取消'),
+                ),
+                FilledButton(
+                  style: FilledButton.styleFrom(
+                    backgroundColor: Theme.of(dialogContext).colorScheme.error,
+                  ),
+                  onPressed: () => Navigator.pop(dialogContext, true),
+                  child: const Text('永久删除'),
+                ),
+              ],
+            ),
+          ),
+        ) ??
+        false;
+    if (!confirmed || !mounted) return;
+    setState(() {
+      exitingAccounts.add(a.id);
+      cleaningAccounts.add(a.id);
+    });
+    try {
+      await guarded(context, () async {
+        await ref.read(workspaceProvider).deleteAccount(a, logout: logout);
+        if (mounted) {
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(SnackBar(content: Text('已清理 ${a.label} 的本地数据')));
+        }
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          exitingAccounts.remove(a.id);
+          cleaningAccounts.remove(a.id);
+        });
+      }
+    }
   }
 
   Future<void> save() async {
@@ -633,8 +881,13 @@ class _AccountDialogState extends ConsumerState<_AccountDialog> {
   final appId = TextEditingController(), secret = TextEditingController();
   AccountRef? current;
   bool busy = false;
+  bool authorizing = false, stopRequested = false;
   late bool configure;
   String? error;
+  String? authStage;
+  String? authorizationNotice;
+  String? openedAuthUrl;
+  bool browserSetup = false;
   Json? status;
   String get platform => widget.platform;
   AccountRef? get existing => widget.existing;
@@ -657,10 +910,42 @@ class _AccountDialogState extends ConsumerState<_AccountDialog> {
     super.dispose();
   }
 
+  Future<void> openAuthorization(String url) async {
+    try {
+      final opened = await launchUrl(
+        Uri.parse(url),
+        mode: LaunchMode.externalApplication,
+      );
+      if (!opened && mounted && !stopRequested) {
+        setState(() => authorizationNotice = '未能打开浏览器，请点击下方按钮或复制链接完成授权。');
+      }
+    } catch (_) {
+      if (mounted && !stopRequested) {
+        setState(() => authorizationNotice = '未能打开浏览器，请点击下方按钮或复制链接完成授权。');
+      }
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final w = ref.watch(workspaceProvider);
     final url = current == null ? null : w.authUrls[current!.id];
+    if (platform == 'feishu' &&
+        authorizing &&
+        !stopRequested &&
+        url != null &&
+        openedAuthUrl != url) {
+      openedAuthUrl = url;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted &&
+            authorizing &&
+            !stopRequested &&
+            current != null &&
+            w.authUrls[current!.id] == url) {
+          unawaited(openAuthorization(url));
+        }
+      });
+    }
     return AlertDialog(
       title: Text(
         '连接 ${platform == 'dingtalk'
@@ -715,14 +1000,28 @@ class _AccountDialogState extends ConsumerState<_AccountDialog> {
                 const SizedBox(height: 14),
                 SelectableText(url, style: const TextStyle(fontSize: 12)),
                 TextButton.icon(
-                  onPressed: () => launchUrl(
-                    Uri.parse(url),
-                    mode: LaunchMode.externalApplication,
-                  ),
+                  onPressed: () => openAuthorization(url),
                   icon: const Icon(Icons.open_in_browser),
                   label: const Text('打开授权页面'),
                 ),
               ],
+              if (busy) Text(authStage ?? '连接验证'),
+              if (platform == 'feishu' && authorizing) ...[
+                const SizedBox(height: 8),
+                if (authStage == '应用初始化')
+                  const Text('第一步：创建应用配置。网页显示“配置成功”后，请返回这里继续用户授权。'),
+                if (authStage == '用户授权')
+                  Text(
+                    browserSetup
+                        ? '应用配置已完成。第二步：授权你的飞书身份，还需在新的授权页面确认。'
+                              '如果仍停留在“配置成功”页面，请打开当前授权链接。'
+                        : '请在用户授权页面确认你的飞书身份。',
+                  ),
+                if (authStage == '用户授权' && url == null)
+                  const Text('正在获取用户授权链接，获得后会自动打开浏览器。'),
+                if (authStage == '连接验证') const Text('用户授权已完成，正在验证连接。'),
+              ],
+              if (authorizationNotice != null) Text(authorizationNotice!),
               if (busy)
                 const Padding(
                   padding: EdgeInsets.symmetric(vertical: 16),
@@ -775,6 +1074,19 @@ class _AccountDialogState extends ConsumerState<_AccountDialog> {
         ),
       ),
       actions: [
+        if (platform == 'feishu' && authorizing)
+          TextButton(
+            onPressed: stopRequested
+                ? null
+                : () {
+                    setState(() {
+                      stopRequested = true;
+                      authStage = '正在中止';
+                    });
+                    if (current != null) w.cancelAuthentication(current!);
+                  },
+            child: Text(stopRequested ? '正在中止' : '中止授权'),
+          ),
         TextButton(
           onPressed: busy ? null : () => Navigator.pop(context),
           child: const Text('关闭'),
@@ -785,6 +1097,13 @@ class _AccountDialogState extends ConsumerState<_AccountDialog> {
               : () async {
                   setState(() {
                     busy = true;
+                    authorizing = true;
+                    stopRequested = false;
+                    authorizationNotice = null;
+                    openedAuthUrl = null;
+                    if (configure) browserSetup = appId.text.trim().isEmpty;
+                    error = null;
+                    authStage = null;
                   });
                   try {
                     current ??= await w.addAccount(
@@ -792,26 +1111,61 @@ class _AccountDialogState extends ConsumerState<_AccountDialog> {
                       label.text.trim().isEmpty ? platform : label.text.trim(),
                     );
                     if (!mounted) return;
+                    if (stopRequested) {
+                      throw const AppFailure('cancelled', '授权已中止');
+                    }
                     final result = await w.authenticate(
                       current!,
                       configure: configure,
                       config: {'appId': appId.text, 'appSecret': secret.text},
+                      onStage: (stage) {
+                        if (!mounted || stopRequested) return;
+                        setState(() {
+                          authStage = stage;
+                          if (stage == '用户授权') {
+                            configure = false;
+                            secret.clear();
+                          }
+                        });
+                      },
                     );
                     if (!mounted) return;
+                    if (stopRequested) {
+                      throw const AppFailure('cancelled', '授权已中止');
+                    }
+                    setState(() => authorizing = false);
                     secret.clear();
                     if (platform == 'dingtalk' &&
                         (result['profiles'] as List? ?? []).isNotEmpty) {
                       setState(() => status = result);
                     } else {
-                      await w.connect(current!);
+                      try {
+                        await w.connect(current!);
+                      } catch (e) {
+                        throw AppFailure('connection', '连接验证失败：$e');
+                      }
                       if (context.mounted) {
                         Navigator.pop(context);
                       }
                     }
                   } catch (e) {
-                    if (context.mounted) setState(() => error = '$e');
+                    if (context.mounted) {
+                      setState(() {
+                        if (stopRequested ||
+                            (e is AppFailure && e.code == 'cancelled')) {
+                          authorizationNotice = '授权已中止';
+                        } else {
+                          error = '$e';
+                        }
+                      });
+                    }
                   } finally {
-                    if (context.mounted) setState(() => busy = false);
+                    if (context.mounted) {
+                      setState(() {
+                        busy = false;
+                        authorizing = false;
+                      });
+                    }
                   }
                 },
           child: Text(busy ? '等待授权' : '开始授权'),
