@@ -4,6 +4,7 @@ import 'package:path/path.dart' as p;
 Future<void> main(List<String> args) async {
   final output = Directory('build/adapters');
   await output.create(recursive: true);
+  final staging = await output.createTemp('.compile-');
   final dart = p.join(
     p.dirname(Platform.resolvedExecutable),
     'dart${Platform.isWindows ? '.exe' : ''}',
@@ -15,6 +16,7 @@ Future<void> main(List<String> args) async {
     mode: ProcessStartMode.inheritStdio,
   );
   if (await pub.exitCode != 0) {
+    await staging.delete(recursive: true);
     exitCode = 1;
     return;
   }
@@ -27,11 +29,16 @@ Future<void> main(List<String> args) async {
       '../../bin/im_adapter.dart',
       '-o',
       p.absolute(
-        p.join(output.path, 'im_adapter${Platform.isWindows ? '.exe' : ''}'),
+        p.join(staging.path, 'im_adapter${Platform.isWindows ? '.exe' : ''}'),
       ),
     ],
     workingDirectory: 'tool/adapter',
     mode: ProcessStartMode.inheritStdio,
   );
   exitCode = await process.exitCode;
+  if (exitCode == 0) {
+    final name = 'im_adapter${Platform.isWindows ? '.exe' : ''}';
+    await File(p.join(staging.path, name)).rename(p.join(output.path, name));
+  }
+  await staging.delete(recursive: true);
 }

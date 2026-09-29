@@ -5,6 +5,8 @@ import pathlib
 import platform
 import shutil
 import subprocess
+import json
+from package_support import install_executable
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 parser = argparse.ArgumentParser()
@@ -38,10 +40,28 @@ else:
 if not app.exists():
     raise SystemExit(f'Application build not found: {app}')
 destination.mkdir(parents=True, exist_ok=True)
-shutil.copy2(adapter, destination / adapter.name)
+def sign_adapter(path):
+    run(['codesign', '--force', '--sign', '-', '--identifier', 'com.sinri.imbroglio.adapter', str(path)])
+    run(['codesign', '--verify', '--strict', str(path)])
+
+installed_adapter = destination / adapter.name
+install_executable(adapter, installed_adapter, sign_adapter if system == 'macos' else None)
 if system == 'macos':
     # Local unsigned distribution. Release signing/notarization needs publisher credentials.
-    run(['codesign', '--force', '--deep', '--sign', '-', str(app)])
+    run(['codesign', '--force', '--sign', '-', str(app)])
+    run(['codesign', '--verify', '--deep', '--strict', str(app)])
+# Exercise the packaged executable, not only its on-disk signature. No account
+# initialization or business API is involved in the shutdown handshake.
+probe = subprocess.run(
+    [str(installed_adapter)],
+    input=json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': 'shutdown', 'params': {}}) + '\n',
+    text=True, capture_output=True, timeout=15, check=True,
+)
+response = json.loads(probe.stdout.strip())
+# A fresh adapter rejects shutdown until initialize, then its main loop exits.
+# This proves both executable launch and JSON-RPC dispatch without using a CLI.
+if response.get('id') != 1 or response.get('error', {}).get('code') != 'state':
+    raise SystemExit('Packaged adapter failed the protocol startup check.')
 output = ROOT / 'dist'
 output.mkdir(exist_ok=True)
 name = f'imbroglio-{system}-{platform.machine()}-{mode}'
