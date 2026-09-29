@@ -579,6 +579,8 @@ class _MessagesPageState extends ConsumerState<MessagesPage> {
                       padding: const EdgeInsets.fromLTRB(20, 12, 20, 16),
                       child: Column(
                         children: [
+                          if (!w.account(c.accountId).canSend)
+                            const Text('缺少发送权限，请到设置为此账号补充发送授权。'),
                           if (reply != null)
                             Row(
                               children: [
@@ -649,7 +651,10 @@ class _MessagesPageState extends ConsumerState<MessagesPage> {
                               ),
                               const SizedBox(width: 12),
                               FilledButton.icon(
-                                onPressed: sending ? null : () => send(),
+                                onPressed:
+                                    sending || !w.account(c.accountId).canSend
+                                    ? null
+                                    : () => send(),
                                 icon: const Icon(Icons.arrow_upward, size: 18),
                                 label: const Text('发送'),
                               ),

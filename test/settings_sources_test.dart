@@ -76,6 +76,33 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
+  testWidgets(
+    'restricted account offers reauthorization without creating an app',
+    (tester) async {
+      await w.store.put('installations', 'feishu', {'enabled': true});
+      w.accounts = [
+        const AccountRef(
+          id: 'a',
+          platform: 'feishu',
+          label: '受限账号',
+          canSend: false,
+        ),
+      ];
+      await showPage(tester, const SettingsPage());
+      await tester.tap(find.text('补充发送授权'));
+      await tester.pumpAndSettle();
+      expect(
+        tester
+            .widget<CheckboxListTile>(
+              find.widgetWithText(CheckboxListTile, '初始化飞书应用配置'),
+            )
+            .value,
+        false,
+      );
+      expect(find.text('App ID（可留空，通过浏览器创建）'), findsNothing);
+    },
+  );
+
   testWidgets('source status stays stable during background updates', (
     tester,
   ) async {

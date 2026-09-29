@@ -19,6 +19,7 @@ class AccountRef {
   final String id, platform, label, profile, organization, userId;
   final bool enabled;
   final bool signedOut;
+  final bool canSend;
   const AccountRef({
     required this.id,
     required this.platform,
@@ -28,6 +29,7 @@ class AccountRef {
     this.userId = '',
     this.enabled = true,
     this.signedOut = false,
+    this.canSend = true,
   });
   factory AccountRef.fromJson(Json j) => AccountRef(
     id: j['id'],
@@ -38,6 +40,7 @@ class AccountRef {
     userId: j['userId'] ?? '',
     enabled: j['enabled'] ?? true,
     signedOut: j['signedOut'] ?? false,
+    canSend: j['canSend'] ?? true,
   );
   Json toJson() => {
     'id': id,
@@ -48,6 +51,7 @@ class AccountRef {
     'userId': userId,
     'enabled': enabled,
     'signedOut': signedOut,
+    'canSend': canSend,
   };
   AccountRef copyWith({
     String? label,
@@ -56,6 +60,7 @@ class AccountRef {
     String? userId,
     bool? enabled,
     bool? signedOut,
+    bool? canSend,
   }) => AccountRef(
     id: id,
     platform: platform,
@@ -65,6 +70,7 @@ class AccountRef {
     userId: userId ?? this.userId,
     enabled: enabled ?? this.enabled,
     signedOut: signedOut ?? this.signedOut,
+    canSend: canSend ?? this.canSend,
   );
 }
 

@@ -6,6 +6,8 @@ import 'package:path/path.dart' as p;
 // ignore: avoid_relative_lib_imports
 import '../lib/src/core/models.dart';
 // ignore: avoid_relative_lib_imports
+import '../lib/src/core/feishu_auth.dart';
+// ignore: avoid_relative_lib_imports
 import '../lib/src/core/normalize.dart';
 // ignore: avoid_relative_lib_imports
 import '../lib/src/core/diagnostics.dart';
@@ -333,7 +335,15 @@ class Adapter {
           id,
           platform == 'dingtalk'
               ? ['auth', 'login', '--no-browser']
-              : ['auth', 'login', '--recommend', '--json'],
+              : [
+                  'auth',
+                  'login',
+                  '--scope',
+                  ((args['scopes'] as List?)?.cast<String>() ??
+                          [...feishuReadScopes, ...feishuSendScopes])
+                      .join(' '),
+                  '--json',
+                ],
           raw: true,
           auth: true,
           timeout: const Duration(minutes: 5),
@@ -355,12 +365,14 @@ class Adapter {
           };
         }
         return {'completed': true};
+      case 'auth.scopes':
+        return await run(id, ['auth', 'scopes', '--json']);
       case 'auth.status':
         final value = await run(
           id,
           platform == 'dingtalk'
               ? scoped(['profile', 'list'])
-              : ['auth', 'status', '--json'],
+              : ['auth', 'status', '--json', '--verify'],
         );
         return {'profiles': rows(value), 'status': value};
       case 'auth.logout':

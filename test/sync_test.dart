@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:drift/native.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:imbroglio/src/core/models.dart';
+import 'package:imbroglio/src/core/feishu_auth.dart';
 import 'package:imbroglio/src/core/rpc.dart';
 import 'package:imbroglio/src/services/store.dart';
 import 'package:imbroglio/src/services/workspace.dart';
@@ -34,6 +35,23 @@ class FakeRpc implements RpcClient {
   @override
   StreamController<Json> get events => throw UnimplementedError();
 }
+
+Json authResponse(String method) => method == 'auth.login'
+    ? {'completed': true, 'userId': 'ou_test'}
+    : {
+        'status': {
+          'appId': 'app',
+          'identities': {
+            'user': {
+              'available': true,
+              'verified': true,
+              'status': 'ready',
+              'openId': 'ou_test',
+              'scope': {...feishuReadScopes, ...feishuSendScopes}.join(' '),
+            },
+          },
+        },
+      };
 
 void main() {
   late Workspace w;
@@ -67,16 +85,38 @@ void main() {
       final calls = <String>[];
       w.clients['a'] = FakeRpc((method, _) {
         calls.add(method);
+        if (method == 'auth.scopes') {
+          return {
+            'appId': 'app',
+            'userScopes': [...feishuReadScopes, ...feishuSendScopes],
+          };
+        }
+        if (method == 'auth.status' && !calls.contains('auth.login')) {
+          return {
+            'status': {
+              'appId': 'app',
+              'identities': {
+                'user': {'status': 'missing'},
+              },
+            },
+          };
+        }
         return method == 'auth.login'
             ? {
                 'completed': true,
+                'userId': 'ou_test',
                 'warning': '部分权限未授予',
                 'missingScopes': ['optional.scope'],
               }
-            : {'status': 'ok'};
+            : authResponse(method);
       });
       final result = await w.authenticate(account);
-      expect(calls, ['auth.login', 'auth.status']);
+      expect(calls, [
+        'auth.status',
+        'auth.scopes',
+        'auth.login',
+        'auth.status',
+      ]);
       expect(result['warning'], '部分权限未授予');
       expect(w.notice, contains('部分权限未授予'));
     },
@@ -199,10 +239,13 @@ void main() {
           entered.complete();
           return pending.future;
         }
-        return {};
+        return authResponse(method);
       });
       w.clients['a'] = rpc;
-      final attempt = w.authenticate(account, configure: true);
+      final attempt = w.authenticate(
+        const AccountRef(id: 'a', platform: 'dingtalk', label: 'test'),
+        configure: true,
+      );
       final assertion = expectLater(
         attempt,
         throwsA(isA<AppFailure>().having((e) => e.code, 'code', 'cancelled')),
@@ -216,7 +259,9 @@ void main() {
       expect(methods.last, methodToCancel);
       first = false;
       methods.clear();
-      await w.authenticate(account);
+      await w.authenticate(
+        const AccountRef(id: 'a', platform: 'dingtalk', label: 'test'),
+      );
       expect(methods, ['auth.login', 'auth.status']);
       pending.complete({});
       await Future<void>.delayed(Duration.zero);
@@ -235,9 +280,13 @@ void main() {
         if (method != 'auth.status') {
           w.authUrls['a'] = 'https://example.com/current';
         }
-        return {'status': 'ok'};
+        return authResponse(method);
       });
-      await w.authenticate(account, configure: true, onStage: stages.add);
+      await w.authenticate(
+        const AccountRef(id: 'a', platform: 'dingtalk', label: 'test'),
+        configure: true,
+        onStage: stages.add,
+      );
       expect(methods, ['auth.configure', 'auth.login', 'auth.status']);
       expect(stages, ['应用初始化', '用户授权', '连接验证']);
       expect(w.authUrls, isEmpty);
@@ -260,7 +309,10 @@ void main() {
         return {};
       });
       await expectLater(
-        w.authenticate(account, configure: true),
+        w.authenticate(
+          const AccountRef(id: 'a', platform: 'dingtalk', label: 'test'),
+          configure: true,
+        ),
         throwsA(
           isA<AppFailure>()
               .having((e) => e.message, 'message', '${failure.value}失败：denied')

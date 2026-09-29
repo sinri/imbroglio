@@ -64,6 +64,19 @@ void main() {
     await tester.pumpAndSettle();
   }
 
+  testWidgets('missing sending scope disables send and explains recovery', (
+    tester,
+  ) async {
+    w.accounts = [w.account('a').copyWith(canSend: false)];
+    w.clients['a'] = FakeRpc((_, _) => {'items': [], 'hasMore': false});
+    await open(tester);
+    expect(find.text('缺少发送权限，请到设置为此账号补充发送授权。'), findsOneWidget);
+    final send = tester.widget<FilledButton>(
+      find.widgetWithText(FilledButton, '发送'),
+    );
+    expect(send.onPressed, isNull);
+  });
+
   for (final lastAccount in [false, true]) {
     testWidgets(
       'logout clears selected chat and ${lastAccount ? 'shows setup' : 'selects a remaining account'}',

@@ -4,9 +4,11 @@ import 'dart:io';
 import 'package:crypto/crypto.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:url_launcher/url_launcher.dart';
 import '../core/models.dart';
+import '../core/feishu_auth.dart';
 import '../services/agent.dart';
 import 'app.dart';
 
@@ -540,7 +542,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
         leading: Icon(a.platform == 'dingtalk' ? Icons.bolt : Icons.flight),
         title: Text(a.label),
         subtitle: Text(
-          '${a.organization.isEmpty ? a.profile : a.organization} · ${a.enabled ? '同步已开启' : '未连接 / 已暂停'}',
+          '${a.organization.isEmpty ? a.profile : a.organization} · ${a.enabled ? '同步已开启' : '未连接 / 已暂停'}${a.canSend ? '' : ' · 缺少发送权限'}',
         ),
         trailing: Wrap(
           spacing: 8,
@@ -555,7 +557,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
               onPressed: exitingAccounts.contains(a.id) || !available
                   ? null
                   : () => accountDialog(context, ref, a.platform, existing: a),
-              child: const Text('授权'),
+              child: Text(a.canSend ? '授权' : '补充发送授权'),
             ),
             if (!a.signedOut)
               TextButton(
@@ -888,6 +890,7 @@ class _AccountDialogState extends ConsumerState<_AccountDialog> {
   String? authorizationNotice;
   String? openedAuthUrl;
   bool browserSetup = false;
+  bool forceAuthorization = false;
   Json? status;
   String get platform => widget.platform;
   AccountRef? get existing => widget.existing;
@@ -908,6 +911,147 @@ class _AccountDialogState extends ConsumerState<_AccountDialog> {
     appId.dispose();
     secret.dispose();
     super.dispose();
+  }
+
+  Future<List<String>?> choosePermissions(Json permissions) async {
+    if (!mounted || stopRequested) return null;
+    final granted = (permissions['granted'] as List).cast<String>().toSet();
+    final appScopes = (permissions['appScopes'] as List).cast<String>().toSet();
+    final available = {...granted, ...appScopes};
+    final canReuse = permissions['canReuse'] == true;
+    if (canReuse &&
+        granted.containsAll({...feishuSendScopes, ...feishuDocumentScopes})) {
+      return [];
+    }
+    var sending = granted.containsAll(feishuSendScopes);
+    var documents = granted.containsAll(feishuDocumentScopes);
+    Widget scopeDetails(Set<String> scopes) => Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        for (final scope in scopes)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 8),
+            child: SelectableText(
+              '$scope\n${granted.contains(scope)
+                  ? '用户已授权'
+                  : appScopes.contains(scope)
+                  ? '应用已开通 · 待用户授权'
+                  : '应用未开通'}',
+              style: const TextStyle(fontSize: 12),
+            ),
+          ),
+      ],
+    );
+    return showDialog<List<String>>(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (context, update) => AlertDialog(
+          title: const Text('飞书已有授权'),
+          content: SizedBox(
+            width: 560,
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('应用：${permissions['appId']}'),
+                  const SizedBox(height: 12),
+                  Text(
+                    canReuse
+                        ? '现有授权可读取消息，可直接连接。其他功能按需补充授权。'
+                        : '需要授权基础消息读取权限后才能连接。',
+                  ),
+                  if (!available.containsAll(feishuReadScopes))
+                    const Text('应用尚未开通基础消息读取权限，请先在飞书开放平台开通后重试。'),
+                  const SizedBox(height: 12),
+                  const Text(
+                    '基础消息读取（必需）',
+                    style: TextStyle(fontWeight: FontWeight.w600),
+                  ),
+                  const Text('在飞书开放平台的用户身份权限中搜索以下标识。'),
+                  const SizedBox(height: 8),
+                  scopeDetails(feishuReadScopes),
+                  TextButton.icon(
+                    onPressed: () async {
+                      await Clipboard.setData(
+                        ClipboardData(text: feishuReadScopes.join('\n')),
+                      );
+                      if (context.mounted) {
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          const SnackBar(content: Text('已复制基础读取权限')),
+                        );
+                      }
+                    },
+                    icon: const Icon(Icons.copy, size: 16),
+                    label: const Text('复制必需权限'),
+                  ),
+                  const Divider(),
+                  CheckboxListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text('发送与回复消息'),
+                    subtitle: Text(
+                      granted.containsAll(feishuSendScopes)
+                          ? '已授权'
+                          : available.containsAll(feishuSendScopes)
+                          ? '可选，需要用户授权'
+                          : '应用尚未开通，请先在飞书开放平台开通',
+                    ),
+                    value: sending,
+                    onChanged:
+                        granted.containsAll(feishuSendScopes) ||
+                            !available.containsAll(feishuSendScopes)
+                        ? null
+                        : (v) => update(() => sending = v!),
+                  ),
+                  scopeDetails(feishuSendScopes),
+                  const Divider(),
+                  CheckboxListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text('搜索与读取文档'),
+                    subtitle: Text(
+                      granted.containsAll(feishuDocumentScopes)
+                          ? '已授权'
+                          : available.containsAll(feishuDocumentScopes)
+                          ? '可选，需要用户授权'
+                          : '应用尚未开通，请先在飞书开放平台开通',
+                    ),
+                    value: documents,
+                    onChanged:
+                        granted.containsAll(feishuDocumentScopes) ||
+                            !available.containsAll(feishuDocumentScopes)
+                        ? null
+                        : (v) => update(() => documents = v!),
+                  ),
+                  scopeDetails(feishuDocumentScopes),
+                ],
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext),
+              child: const Text('取消'),
+            ),
+            if (canReuse)
+              TextButton(
+                onPressed: () => Navigator.pop(dialogContext, <String>[]),
+                child: const Text('使用现有授权连接'),
+              ),
+            FilledButton(
+              onPressed: !available.containsAll(feishuReadScopes)
+                  ? null
+                  : () => Navigator.pop(dialogContext, <String>[
+                      ...feishuReadScopes,
+                      if (sending) ...feishuSendScopes,
+                      if (documents) ...feishuDocumentScopes,
+                    ]),
+              child: Text(canReuse ? '授权所选功能' : '授权并连接'),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 
   Future<void> openAuthorization(String url) async {
@@ -976,6 +1120,14 @@ class _AccountDialogState extends ConsumerState<_AccountDialog> {
                       ? null
                       : (v) => setState(() => configure = v!),
                   title: const Text('初始化飞书应用配置'),
+                ),
+                CheckboxListTile(
+                  contentPadding: EdgeInsets.zero,
+                  value: forceAuthorization,
+                  onChanged: busy
+                      ? null
+                      : (v) => setState(() => forceAuthorization = v!),
+                  title: const Text('重新授权（不复用现有登录）'),
                 ),
                 if (configure) ...[
                   TextField(
@@ -1117,12 +1269,19 @@ class _AccountDialogState extends ConsumerState<_AccountDialog> {
                     final result = await w.authenticate(
                       current!,
                       configure: configure,
-                      config: {'appId': appId.text, 'appSecret': secret.text},
+                      config: {
+                        'appId': appId.text,
+                        'appSecret': secret.text,
+                        'forceAuthorization': forceAuthorization,
+                      },
+                      onPermissions: platform == 'feishu'
+                          ? choosePermissions
+                          : null,
                       onStage: (stage) {
                         if (!mounted || stopRequested) return;
                         setState(() {
                           authStage = stage;
-                          if (stage == '用户授权') {
+                          if (stage == '用户授权' || stage == '检查现有授权') {
                             configure = false;
                             secret.clear();
                           }
@@ -1140,7 +1299,12 @@ class _AccountDialogState extends ConsumerState<_AccountDialog> {
                       setState(() => status = result);
                     } else {
                       try {
-                        await w.connect(current!);
+                        await w.connect(
+                          current!.copyWith(
+                            canSend: result['canSend'] != false,
+                          ),
+                          userId: '${result['userId'] ?? ''}',
+                        );
                       } catch (e) {
                         throw AppFailure('connection', '连接验证失败：$e');
                       }
@@ -1168,7 +1332,7 @@ class _AccountDialogState extends ConsumerState<_AccountDialog> {
                     }
                   }
                 },
-          child: Text(busy ? '等待授权' : '开始授权'),
+          child: Text(busy ? '处理中' : '开始授权'),
         ),
       ],
     );

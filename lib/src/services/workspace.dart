@@ -7,6 +7,7 @@ import 'package:flutter/services.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import '../core/models.dart';
+import '../core/feishu_auth.dart';
 import '../core/normalize.dart';
 import '../core/rpc.dart';
 import '../core/diagnostics.dart';
@@ -476,6 +477,7 @@ class Workspace extends ChangeNotifier {
     bool configure = false,
     Json config = const {},
     void Function(String stage)? onStage,
+    Future<List<String>?> Function(Json permissions)? onPermissions,
   }) async {
     if (_authorizations.containsKey(a.id)) {
       throw const AppFailure('busy', '授权正在进行');
@@ -487,7 +489,11 @@ class Workspace extends ChangeNotifier {
     );
     Future<T> wait<T>(Future<T> operation) =>
         Future.any([operation, cancellation]);
-    var stage = configure ? '应用初始化' : '用户授权';
+    var stage = configure
+        ? '应用初始化'
+        : a.platform == 'feishu'
+        ? '检查现有授权'
+        : '用户授权';
     void progress(String next) {
       stage = next;
       authUrls.remove(a.id);
@@ -502,13 +508,102 @@ class Workspace extends ChangeNotifier {
         await wait(
           rpc.call('auth.configure', config, const Duration(minutes: 6)),
         );
-        progress('用户授权');
       }
+      Json loginArgs = {};
+      String? expectedAppId;
+      if (a.platform == 'feishu') {
+        progress('检查现有授权');
+        final prior = object(await wait(rpc.call('auth.status')));
+        final priorUser = feishuUser(prior);
+        final valid = feishuVerified(priorUser);
+        if (!valid &&
+            config['forceAuthorization'] != true &&
+            !['missing', 'not_configured'].contains(priorUser['status'])) {
+          throw AppFailure(
+            'authentication',
+            '暂时无法验证已有授权，请重试；也可主动选择重新授权。${diagnosticText('${priorUser['message'] ?? ''}')}',
+          );
+        }
+        if (valid && a.userId.isNotEmpty && a.userId != priorUser['openId']) {
+          throw const AppFailure('identity', '当前飞书用户与已绑定账号不一致');
+        }
+        final app = object(await wait(rpc.call('auth.scopes')));
+        if (app['appId'] is! String ||
+            (app['appId'] as String).isEmpty ||
+            app['userScopes'] is! List ||
+            app['appId'] != object(prior['status'])['appId']) {
+          throw const AppFailure('contract', '飞书应用权限查询结果与当前应用不一致');
+        }
+        expectedAppId = app['appId'] as String;
+        final granted = feishuScopes(priorUser);
+        final appScopes = (app['userScopes'] as List)
+            .whereType<String>()
+            .toSet();
+        final canReuse =
+            valid &&
+            config['forceAuthorization'] != true &&
+            granted.containsAll(feishuReadScopes);
+        final permissions = <String, dynamic>{
+          'appId': app['appId'],
+          'userId': priorUser['openId'],
+          'canReuse': canReuse,
+          'granted': granted.toList(),
+          'appScopes': appScopes.toList(),
+        };
+        final selected = onPermissions == null
+            ? (canReuse ? <String>[] : feishuReadScopes.toList())
+            : await wait(onPermissions(permissions));
+        if (selected == null) throw const AppFailure('cancelled', '授权已中止');
+        if (canReuse && granted.containsAll(selected)) {
+          prior['userId'] = priorUser['openId'];
+          prior['canSend'] = granted.containsAll(feishuSendScopes);
+          return prior;
+        }
+        final requested = {...granted, ...feishuReadScopes, ...selected};
+        final unavailable = requested.difference(appScopes).difference(granted);
+        if (unavailable.isNotEmpty) {
+          throw const AppFailure('permission', '应用尚未开通所选功能的权限，请先在飞书开放平台开通后重试');
+        }
+        loginArgs = {'scopes': requested.toList()..sort()};
+      }
+      progress('用户授权');
       final login = object(
-        await wait(rpc.call('auth.login', {}, const Duration(minutes: 6))),
+        await wait(
+          rpc.call('auth.login', loginArgs, const Duration(minutes: 6)),
+        ),
       );
       progress('连接验证');
       final result = object(await wait(rpc.call('auth.status')));
+      if (a.platform == 'feishu') {
+        final user = object(
+          object(object(result['status'])['identities'])['user'],
+        );
+        final openId = user['openId'];
+        if (user['available'] != true ||
+            user['verified'] != true ||
+            !['ready', 'needs_refresh'].contains(user['status']) ||
+            openId is! String ||
+            openId.isEmpty) {
+          throw AppFailure(
+            'authentication',
+            '飞书用户身份未通过验证，请检查网络或重新授权。'
+                '${diagnosticText('${user['message'] ?? ''}')}',
+          );
+        }
+        if (login['userId'] != openId ||
+            (a.userId.isNotEmpty && a.userId != openId) ||
+            object(result['status'])['appId'] != expectedAppId) {
+          throw const AppFailure('identity', '飞书登录与验证的用户身份不一致，请重新授权');
+        }
+        final scopes = feishuScopes(user);
+        if (!scopes.containsAll(feishuReadScopes)) {
+          throw const AppFailure('permission', '基础消息读取权限未授予，暂时无法连接；请开通权限后重试');
+        }
+        result['userId'] = openId;
+        result['canSend'] =
+            scopes.contains('im:message.send_as_user') &&
+            scopes.contains('im:message');
+      }
       if (login['warning'] is String) {
         notice = '${a.label}：${diagnosticText(login['warning'] as String)}';
         result['warning'] = login['warning'];
@@ -539,6 +634,7 @@ class Workspace extends ChangeNotifier {
       'auth.configure',
       'auth.login',
       'auth.status',
+      'auth.scopes',
     });
     authUrls.remove(a.id);
     changed();
@@ -558,8 +654,9 @@ class Workspace extends ChangeNotifier {
       enabled: true,
       signedOut: false,
     );
-    await saveAccount(connected);
+    await saveAccount(connected.copyWith(enabled: false));
     await refreshConversations(connected);
+    await saveAccount(connected);
   }
 
   Future<void> disconnect(AccountRef a, {bool logout = false}) async {
@@ -1411,6 +1508,9 @@ class Workspace extends ChangeNotifier {
     bool image = false,
     bool markdown = false,
   }) async {
+    if (!account(c.accountId).canSend) {
+      throw const AppFailure('permission', '缺少发送权限，请在设置中为此账号补充发送授权');
+    }
     final id = newId();
     final record = {
       'id': id,
