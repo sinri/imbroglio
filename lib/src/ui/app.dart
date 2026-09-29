@@ -116,7 +116,12 @@ class _WorkspaceShellState extends ConsumerState<WorkspaceShell> {
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              Icon(Icons.hub_outlined, size: 48, color: color.primary),
+              Image.asset(
+                'assets/branding/logo.png',
+                width: 160,
+                height: 160,
+                semanticLabel: 'Imbroglio',
+              ),
               const SizedBox(height: 20),
               Text(
                 'Imbroglio',
@@ -145,14 +150,14 @@ class _WorkspaceShellState extends ConsumerState<WorkspaceShell> {
             child: Column(
               children: [
                 const SizedBox(height: 30),
-                Container(
-                  width: 42,
-                  height: 42,
-                  decoration: BoxDecoration(
-                    color: color.primary,
-                    borderRadius: BorderRadius.circular(14),
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(10),
+                  child: Image.asset(
+                    'assets/branding/logo.png',
+                    width: 64,
+                    height: 64,
+                    semanticLabel: 'Imbroglio',
                   ),
-                  child: Icon(Icons.hub_outlined, color: color.onPrimary),
                 ),
                 const SizedBox(height: 30),
                 Expanded(
