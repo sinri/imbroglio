@@ -65,3 +65,11 @@ python3 tool/package.py
 参见 [架构与验收](docs/ARCHITECTURE.md) 和 [验证记录](docs/VALIDATION.md)。
 
 - 原 IM 会话免打扰：钉钉与飞书的新消息通知遵循原平台的免打扰状态，消息同步和未读统计照常进行。通知前按需刷新状态，缓存 60 秒；查询失败保留已有状态，首次未知暂不通知。钉钉刷新会枚举账号会话列表，飞书批量查询会话设置。
+
+## 作者与问题反馈
+
+作者：Sinri Edogawa。
+
+Copyright © 2026 Sinri Edogawa. All rights reserved.
+
+遇到问题或有改进建议，请前往 [GitHub Issues](https://github.com/sinri/imbroglio/issues) 反馈。

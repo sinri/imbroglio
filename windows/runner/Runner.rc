@@ -89,11 +89,11 @@ BEGIN
     BEGIN
         BLOCK "040904e4"
         BEGIN
-            VALUE "CompanyName", "dev.imbroglio" "\0"
+            VALUE "CompanyName", "Sinri Edogawa" "\0"
             VALUE "FileDescription", "imbroglio" "\0"
             VALUE "FileVersion", VERSION_AS_STRING "\0"
             VALUE "InternalName", "imbroglio" "\0"
-            VALUE "LegalCopyright", "Copyright (C) 2026 dev.imbroglio. All rights reserved." "\0"
+            VALUE "LegalCopyright", "Copyright (C) 2026 Sinri Edogawa. All rights reserved." "\0"
             VALUE "OriginalFilename", "imbroglio.exe" "\0"
             VALUE "ProductName", "imbroglio" "\0"
             VALUE "ProductVersion", VERSION_AS_STRING "\0"
