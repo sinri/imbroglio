@@ -10,6 +10,7 @@ import 'package:url_launcher/url_launcher.dart';
 import '../core/models.dart';
 import '../core/feishu_auth.dart';
 import '../services/agent.dart';
+import '../services/agent_limits.dart';
 import 'app.dart';
 import 'conversation_blacklist.dart';
 
@@ -287,6 +288,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
       key = TextEditingController();
   bool loaded = false, saving = false, editingModel = false;
   bool removeModelKey = false;
+  int contextLimit = 1000000;
   bool? hasModelKey;
   Json? savedModel;
   final exitingAccounts = <String>{};
@@ -374,6 +376,28 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
           onPressed: () => audit(),
           icon: const Icon(Icons.receipt_long_outlined),
           label: const Text('查看执行记录'),
+        ),
+        const SizedBox(height: 32),
+        Text('关于 Imbroglio', style: Theme.of(context).textTheme.titleLarge),
+        const SizedBox(height: 8),
+        const Text('作者：Sinri Edogawa'),
+        const SizedBox(height: 8),
+        const Text('Copyright © 2026 Sinri Edogawa. All rights reserved.'),
+        const SizedBox(height: 12),
+        const SelectableText('https://github.com/sinri/imbroglio/issues'),
+        const SizedBox(height: 8),
+        OutlinedButton.icon(
+          onPressed: () => guarded(context, () async {
+            final opened = await launchUrl(
+              Uri.parse('https://github.com/sinri/imbroglio/issues'),
+              mode: LaunchMode.externalApplication,
+            );
+            if (!opened) {
+              throw StateError('无法打开浏览器，请复制上方链接进行问题反馈。');
+            }
+          }),
+          icon: const Icon(Icons.open_in_new),
+          label: const Text('GitHub Issues · 问题反馈'),
         ),
       ],
     );
@@ -702,6 +726,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
   void startModelEditing() {
     base.text = savedModel?['baseUrl'] ?? 'https://api.openai.com/v1';
     model.text = savedModel?['model'] ?? '';
+    contextLimit = AgentLimits.readContextLimit(savedModel?['contextLimit']);
     key.clear();
     setState(() {
       removeModelKey = false;
@@ -738,6 +763,27 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                           controller: model,
                           enabled: !saving,
                           decoration: const InputDecoration(labelText: '模型名称'),
+                        ),
+                        const SizedBox(height: 14),
+                        DropdownButtonFormField<int>(
+                          initialValue: contextLimit,
+                          decoration: const InputDecoration(
+                            labelText: '上下文限制',
+                            helperText: '默认 1M tokens，请按模型支持的上限选择',
+                          ),
+                          items: AgentLimits.contextOptions.entries
+                              .map(
+                                (entry) => DropdownMenuItem(
+                                  value: entry.key,
+                                  child: Text(entry.value),
+                                ),
+                              )
+                              .toList(),
+                          onChanged: saving
+                              ? null
+                              : (value) => setState(() {
+                                  contextLimit = value ?? 1000000;
+                                }),
                         ),
                         const SizedBox(height: 14),
                         TextField(
@@ -800,6 +846,10 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                           const SizedBox(height: 12),
                           const Text('模型名称'),
                           SelectableText(savedModel!['model'] as String? ?? ''),
+                          const SizedBox(height: 12),
+                          Text(
+                            '上下文限制：${AgentLimits.contextOptions[AgentLimits.readContextLimit(savedModel?['contextLimit'])]} tokens',
+                          ),
                         ],
                         const SizedBox(height: 12),
                         Text(
@@ -837,6 +887,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
         final config = <String, dynamic>{
           'baseUrl': base.text.trim(),
           'model': model.text.trim(),
+          'contextLimit': contextLimit,
         };
         await ref
             .read(workspaceProvider)

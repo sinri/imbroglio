@@ -58,6 +58,30 @@ void main() {
     await tester.pumpAndSettle();
   }
 
+  testWidgets('context defaults to 1M, persists selection and cancels draft', (
+    tester,
+  ) async {
+    await show(tester);
+    expect(find.text('上下文限制：1M tokens'), findsOneWidget);
+    await tap(tester, '编辑配置');
+    await tester.tap(find.byType(DropdownButtonFormField<int>));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('128K').last);
+    await tester.pumpAndSettle();
+    await tap(tester, '保存模型配置');
+    expect((await w.store.get('settings', 'model'))!['contextLimit'], 128000);
+    expect(find.text('上下文限制：128K tokens'), findsOneWidget);
+    await tap(tester, '编辑配置');
+    await tester.tap(find.byType(DropdownButtonFormField<int>));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('32K').last);
+    await tester.pumpAndSettle();
+    await tap(tester, '取消');
+    await tap(tester, '编辑配置');
+    expect(find.text('128K'), findsOneWidget);
+    expect((await w.store.get('settings', 'model'))!['contextLimit'], 128000);
+  });
+
   testWidgets('cancel discards draft and pending credential deletion', (
     tester,
   ) async {

@@ -231,7 +231,7 @@ class AgentController extends ChangeNotifier {
       final settings = await workspace.store.get('settings', 'model') ?? {};
       final uri = completionUri('${settings['baseUrl'] ?? ''}');
       final model = '${settings['model'] ?? ''}';
-      final limits = AgentLimits(model);
+      final limits = AgentLimits(model, contextLimit: settings['contextLimit']);
       if (model.isEmpty) throw const AppFailure('model', '请先配置模型名称');
       final key = await secureStorage.read(key: modelKey) ?? '';
       history.add({'role': 'user', 'content': prompt});
@@ -267,7 +267,7 @@ class AgentController extends ChangeNotifier {
             'model': model,
             'stream': true,
             'messages': messages,
-            if (limits.isQwenFlash) 'max_tokens': AgentLimits.outputTokens,
+            'max_tokens': limits.maxOutputTokens,
             if (tools.isNotEmpty) 'tools': tools,
             if (tools.isNotEmpty) 'tool_choice': 'auto',
           });
