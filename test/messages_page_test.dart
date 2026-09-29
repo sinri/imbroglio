@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:io';
-import 'dart:ui' show PointerDeviceKind;
+import 'dart:ui' show PointerDeviceKind, ImageByteFormat;
+import 'package:flutter/rendering.dart';
 import 'package:drift/native.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -63,6 +64,61 @@ void main() {
     );
     await tester.pumpAndSettle();
   }
+
+  testWidgets(
+    'scrolling selected conversation does not paint over the header',
+    (tester) async {
+      w.conversations = [
+        chat,
+        ...List.generate(
+          30,
+          (i) => Conversation(accountId: 'a', id: 'c$i', title: '会话$i'),
+        ),
+      ];
+      w.selectedConversation = chat;
+      await tester.binding.setSurfaceSize(const Size(1120, 740));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      final boundaryKey = GlobalKey();
+      await tester.pumpWidget(
+        ProviderScope(
+          overrides: [workspaceProvider.overrideWith((ref) => w)],
+          child: MaterialApp(
+            home: RepaintBoundary(
+              key: boundaryKey,
+              child: Scaffold(body: MessagesPage(onSetup: () {})),
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      Future<List<int>> headerPixels() async {
+        final boundary =
+            boundaryKey.currentContext!.findRenderObject()
+                as RenderRepaintBoundary;
+        return (await tester.runAsync(() async {
+          final image = await boundary.toImage();
+          final bytes = (await image.toByteData(
+            format: ImageByteFormat.rawRgba,
+          ))!;
+          final pixels = bytes.buffer
+              .asUint8List(0, image.width * 140 * 4)
+              .toList();
+          image.dispose();
+          return pixels;
+        }))!;
+      }
+
+      final before = await headerPixels();
+      final list = find.byType(ListView).first;
+      await tester.drag(list, const Offset(0, -180));
+      await tester.pumpAndSettle();
+      expect(await headerPixels(), before);
+      await tester.drag(list, const Offset(0, 180));
+      await tester.pumpAndSettle();
+      expect(await headerPixels(), before);
+      expect(tester.takeException(), isNull);
+    },
+  );
 
   testWidgets('missing sending scope disables send and explains recovery', (
     tester,

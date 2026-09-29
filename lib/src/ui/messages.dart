@@ -256,51 +256,58 @@ class _MessagesPageState extends ConsumerState<MessagesPage> {
                                   details.globalPosition,
                                 ),
                               ),
-                              child: ListTile(
-                                shape: RoundedRectangleBorder(
-                                  borderRadius: BorderRadius.circular(12),
-                                ),
-                                selected: c?.key == chat.key,
-                                selectedTileColor: scheme.primaryContainer
-                                    .withValues(alpha: .5),
-                                leading: SenderAvatar(
-                                  name: chat.title,
-                                  url: chat.avatar,
-                                  radius: 20,
-                                  fallbackIcon: chat.kind == 'group'
-                                      ? Icons.group_outlined
-                                      : null,
-                                ),
-                                title: Text(
-                                  chat.title,
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
-                                  style: const TextStyle(
-                                    fontSize: 14,
-                                    fontWeight: FontWeight.w600,
+                              // Keep tile ink inside the scrolling row instead of
+                              // painting it on the page Material above the viewport.
+                              child: Material(
+                                type: MaterialType.transparency,
+                                clipBehavior: Clip.antiAlias,
+                                borderRadius: BorderRadius.circular(12),
+                                child: ListTile(
+                                  shape: RoundedRectangleBorder(
+                                    borderRadius: BorderRadius.circular(12),
                                   ),
-                                ),
-                                subtitle: Text(
-                                  '${w.account(chat.accountId).platform == 'dingtalk' ? '钉钉' : '飞书'} · ${w.isConversationExcluded(chat)
-                                      ? '已排除自动同步'
-                                      : chat.watched
-                                      ? '已关注'
-                                      : timeLabel(chat.updatedAt)}',
-                                  style: const TextStyle(fontSize: 11),
-                                ),
-                                trailing: chat.unread > 0
-                                    ? Tooltip(
-                                        message: chat.unreadIsLocal
-                                            ? '本应用未读（原平台未提供已读状态）'
-                                            : '平台未读',
-                                        child: Badge(
-                                          label: Text('${chat.unread}'),
-                                        ),
-                                      )
-                                    : null,
-                                onTap: () => guarded(
-                                  context,
-                                  () => w.selectConversation(chat),
+                                  selected: c?.key == chat.key,
+                                  selectedTileColor: scheme.primaryContainer
+                                      .withValues(alpha: .5),
+                                  leading: SenderAvatar(
+                                    name: chat.title,
+                                    url: chat.avatar,
+                                    radius: 20,
+                                    fallbackIcon: chat.kind == 'group'
+                                        ? Icons.group_outlined
+                                        : null,
+                                  ),
+                                  title: Text(
+                                    chat.title,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: const TextStyle(
+                                      fontSize: 14,
+                                      fontWeight: FontWeight.w600,
+                                    ),
+                                  ),
+                                  subtitle: Text(
+                                    '${w.account(chat.accountId).platform == 'dingtalk' ? '钉钉' : '飞书'} · ${w.isConversationExcluded(chat)
+                                        ? '已排除自动同步'
+                                        : chat.watched
+                                        ? '已关注'
+                                        : timeLabel(chat.updatedAt)}',
+                                    style: const TextStyle(fontSize: 11),
+                                  ),
+                                  trailing: chat.unread > 0
+                                      ? Tooltip(
+                                          message: chat.unreadIsLocal
+                                              ? '本应用未读（原平台未提供已读状态）'
+                                              : '平台未读',
+                                          child: Badge(
+                                            label: Text('${chat.unread}'),
+                                          ),
+                                        )
+                                      : null,
+                                  onTap: () => guarded(
+                                    context,
+                                    () => w.selectConversation(chat),
+                                  ),
                                 ),
                               ),
                             ),
