@@ -7,7 +7,10 @@ import '../core/approval.dart';
 import '../core/models.dart';
 import 'workspace.dart';
 
-const secureStorage = FlutterSecureStorage();
+// Ad-hoc signed macOS builds use the traditional Keychain without access groups.
+const secureStorage = FlutterSecureStorage(
+  mOptions: MacOsOptions(usesDataProtectionKeychain: false),
+);
 const modelKey = 'imbroglio.model.apiKey';
 Json tool(
   String name,

@@ -285,7 +285,10 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
   final base = TextEditingController(),
       model = TextEditingController(),
       key = TextEditingController();
-  bool loaded = false, saving = false;
+  bool loaded = false, saving = false, editingModel = false;
+  bool removeModelKey = false;
+  bool? hasModelKey;
+  Json? savedModel;
   final exitingAccounts = <String>{};
   final cleaningAccounts = <String>{};
   final _sourceQueries = <String, ({Object version, Future<Json?> future})>{};
@@ -299,11 +302,13 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
           .get('settings', 'model');
       if (mounted) {
         setState(() {
+          savedModel = saved;
           base.text = saved?['baseUrl'] ?? 'https://api.openai.com/v1';
           model.text = saved?['model'] ?? '';
           loaded = true;
         });
       }
+      await refreshModelKeyStatus();
     });
   }
 
@@ -354,46 +359,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
         const SizedBox(height: 8),
         const Text('兼容 Chat Completions 的流式输出与工具调用。Agent 所选资料将发送至下方服务。'),
         const SizedBox(height: 18),
-        TextField(
-          controller: base,
-          decoration: const InputDecoration(
-            labelText: 'API 基础地址',
-            hintText: 'https://example.com/v1',
-          ),
-        ),
-        const SizedBox(height: 14),
-        TextField(
-          controller: model,
-          decoration: const InputDecoration(labelText: '模型名称'),
-        ),
-        const SizedBox(height: 14),
-        TextField(
-          controller: key,
-          obscureText: true,
-          autocorrect: false,
-          enableSuggestions: false,
-          decoration: const InputDecoration(
-            labelText: 'API 密钥',
-            hintText: '留空保留已存密钥；仅保存到系统安全存储',
-          ),
-        ),
-        const SizedBox(height: 14),
-        Row(
-          children: [
-            FilledButton(
-              onPressed: saving || !loaded ? null : () => save(),
-              child: Text(saving ? '保存中' : '保存模型配置'),
-            ),
-            const SizedBox(width: 12),
-            TextButton(
-              onPressed: () => guarded(context, () async {
-                await secureStorage.delete(key: modelKey);
-                key.clear();
-              }),
-              child: const Text('删除已存密钥'),
-            ),
-          ],
-        ),
+        modelService(),
         const SizedBox(height: 32),
         Text('本地数据', style: Theme.of(context).textTheme.titleLarge),
         const SizedBox(height: 8),
@@ -723,26 +689,174 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     }
   }
 
+  Future<void> refreshModelKeyStatus() async {
+    bool? exists;
+    try {
+      exists = await secureStorage.containsKey(key: modelKey);
+    } catch (_) {
+      // A storage failure must not be presented as a missing credential.
+    }
+    if (mounted) setState(() => hasModelKey = exists);
+  }
+
+  void startModelEditing() {
+    base.text = savedModel?['baseUrl'] ?? 'https://api.openai.com/v1';
+    model.text = savedModel?['model'] ?? '';
+    key.clear();
+    setState(() {
+      removeModelKey = false;
+      editingModel = true;
+    });
+  }
+
+  Widget modelService() {
+    return Card(
+      margin: EdgeInsets.zero,
+      child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: !loaded
+            ? const LinearProgressIndicator()
+            : Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: editingModel
+                    ? [
+                        Text(
+                          '编辑模型服务',
+                          style: Theme.of(context).textTheme.titleMedium,
+                        ),
+                        const SizedBox(height: 18),
+                        TextField(
+                          controller: base,
+                          enabled: !saving,
+                          decoration: const InputDecoration(
+                            labelText: 'API 基础地址',
+                            hintText: 'https://example.com/v1',
+                          ),
+                        ),
+                        const SizedBox(height: 14),
+                        TextField(
+                          controller: model,
+                          enabled: !saving,
+                          decoration: const InputDecoration(labelText: '模型名称'),
+                        ),
+                        const SizedBox(height: 14),
+                        TextField(
+                          controller: key,
+                          enabled: !saving && !removeModelKey,
+                          obscureText: true,
+                          autocorrect: false,
+                          enableSuggestions: false,
+                          decoration: const InputDecoration(
+                            labelText: 'API 密钥',
+                            helperText: '留空保留已存密钥；新密钥仅保存到系统安全存储',
+                          ),
+                        ),
+                        if (hasModelKey != false)
+                          CheckboxListTile(
+                            contentPadding: EdgeInsets.zero,
+                            title: const Text('删除已存密钥'),
+                            subtitle: const Text('保存后生效；取消编辑将保留原密钥'),
+                            value: removeModelKey,
+                            onChanged: saving
+                                ? null
+                                : (value) => setState(
+                                    () => removeModelKey = value ?? false,
+                                  ),
+                          ),
+                        const SizedBox(height: 18),
+                        Wrap(
+                          spacing: 12,
+                          runSpacing: 8,
+                          children: [
+                            FilledButton(
+                              onPressed: saving ? null : save,
+                              child: Text(saving ? '保存中…' : '保存模型配置'),
+                            ),
+                            TextButton(
+                              onPressed: saving
+                                  ? null
+                                  : () {
+                                      key.clear();
+                                      setState(() => editingModel = false);
+                                    },
+                              child: const Text('取消'),
+                            ),
+                          ],
+                        ),
+                      ]
+                    : [
+                        Text(
+                          savedModel == null ? '尚未配置' : '当前配置',
+                          style: Theme.of(context).textTheme.titleMedium,
+                        ),
+                        const SizedBox(height: 12),
+                        if (savedModel == null)
+                          const Text('配置模型服务后，即可使用 AI 助手。')
+                        else ...[
+                          const Text('API 基础地址'),
+                          SelectableText(
+                            savedModel!['baseUrl'] as String? ?? '',
+                          ),
+                          const SizedBox(height: 12),
+                          const Text('模型名称'),
+                          SelectableText(savedModel!['model'] as String? ?? ''),
+                        ],
+                        const SizedBox(height: 12),
+                        Text(
+                          'API 密钥：${hasModelKey == null
+                              ? '状态暂不可用'
+                              : hasModelKey!
+                              ? '已保存'
+                              : '未设置'}',
+                        ),
+                        const SizedBox(height: 18),
+                        OutlinedButton.icon(
+                          onPressed: startModelEditing,
+                          icon: const Icon(Icons.edit_outlined),
+                          label: Text(savedModel == null ? '配置模型服务' : '编辑配置'),
+                        ),
+                      ],
+              ),
+      ),
+    );
+  }
+
   Future<void> save() async {
     setState(() => saving = true);
-    await guarded(context, () async {
-      completionUri(base.text);
-      if (model.text.trim().isEmpty) throw const AppFailure('model', '请填写模型名称');
-      if (key.text.isNotEmpty) {
-        await secureStorage.write(key: modelKey, value: key.text);
-      }
-      await ref.read(workspaceProvider).store.put('settings', 'model', {
-        'baseUrl': base.text.trim(),
-        'model': model.text.trim(),
+    try {
+      await guarded(context, () async {
+        completionUri(base.text);
+        if (model.text.trim().isEmpty) {
+          throw const AppFailure('model', '请填写模型名称');
+        }
+        if (removeModelKey) {
+          await secureStorage.delete(key: modelKey);
+        } else if (key.text.isNotEmpty) {
+          await secureStorage.write(key: modelKey, value: key.text);
+        }
+        final config = <String, dynamic>{
+          'baseUrl': base.text.trim(),
+          'model': model.text.trim(),
+        };
+        await ref
+            .read(workspaceProvider)
+            .store
+            .put('settings', 'model', config);
+        key.clear();
+        if (mounted) {
+          setState(() {
+            savedModel = config;
+            editingModel = false;
+          });
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(const SnackBar(content: Text('模型配置已保存')));
+        }
       });
-      key.clear();
-      if (mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(const SnackBar(content: Text('模型配置已保存')));
-      }
-    });
-    if (mounted) setState(() => saving = false);
+    } finally {
+      await refreshModelKeyStatus();
+      if (mounted) setState(() => saving = false);
+    }
   }
 
   Future<void> audit() async {
