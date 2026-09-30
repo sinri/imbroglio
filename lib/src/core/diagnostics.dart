@@ -54,3 +54,23 @@ bool confidentialFailure(String message) =>
     (message.contains('无法获取') ||
         message.contains('不支持') ||
         message.contains('不允许'));
+
+/// Transport failures are recoverable; permission and API validation errors are not.
+bool transientNetworkFailure(Object error) {
+  final text = error.toString().toLowerCase();
+  return [
+    'no such host',
+    'failed host lookup',
+    'network is unreachable',
+    'network is down',
+    'connection refused',
+    'connection reset',
+    'connection timed out',
+    'i/o timeout',
+    'socketexception',
+    'timeoutexception',
+    'temporary failure in name resolution',
+    'tls handshake timeout',
+    'client.timeout exceeded',
+  ].any(text.contains);
+}

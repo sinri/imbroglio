@@ -16,8 +16,47 @@ import '../core/diagnostics.dart';
 import 'plugins.dart';
 import 'store.dart';
 import 'activity.dart';
+import 'network.dart';
 
 class Workspace extends ChangeNotifier {
+  final networkMonitor = NetworkMonitor();
+  bool offline = false;
+  bool checkingNetwork = false;
+  bool get waitingForNetwork => offline || _networkRetry.isNotEmpty;
+
+  void updateNetworkAvailability(bool available) {
+    if (closing || offline == !available) return;
+    offline = !available;
+    if (available) {
+      // Bring recovery probes forward without advancing any sync checkpoint.
+      for (final id in _networkRetry.keys.toList()) {
+        _networkRetry[id] = DateTime.fromMillisecondsSinceEpoch(0);
+      }
+      if (ready) tick();
+    }
+    changed();
+  }
+
+  Future<void> retryNetwork() async {
+    if (checkingNetwork || closing) return;
+    checkingNetwork = true;
+    changed();
+    try {
+      final available = await networkMonitor.check();
+      if (closing) return;
+      if (available != null) updateNetworkAvailability(available);
+      if (!offline) {
+        for (final id in _networkRetry.keys.toList()) {
+          _networkRetry[id] = DateTime.fromMillisecondsSinceEpoch(0);
+        }
+        tick();
+      }
+    } finally {
+      checkingNetwork = false;
+      if (!closing) changed();
+    }
+  }
+
   final startupTrace = StartupTrace();
   String? _startupTracePath;
   Future<void> saveStartupTrace() async {
@@ -74,6 +113,67 @@ class Workspace extends ChangeNotifier {
   final _busy = <String>{}, _updating = <String>{};
   final _backoff = <String, DateTime>{};
   final _next = <String, DateTime>{};
+  static const _offlineNotice = '网络暂不可用，后台同步已降频，将自动重试。已缓存的消息仍可查看。';
+  final _networkRetry = <String, DateTime>{};
+  final _networkFailures = <String, int>{};
+  final _networkChats = <String>{};
+
+  bool _networkFailed(AccountRef a, Object error, {DateTime? at}) {
+    if (!(error is AppFailure && error.code == 'offline') &&
+        !transientNetworkFailure(error)) {
+      return false;
+    }
+    final now = at ?? DateTime.now();
+    // Concurrent failures belong to one outage, not separate retry attempts.
+    if (!(_networkRetry[a.id]?.isAfter(now) ?? false)) {
+      final failures = (_networkFailures[a.id] ?? 0) + 1;
+      _networkFailures[a.id] = failures;
+      _networkRetry[a.id] = now.add(
+        Duration(seconds: (15 * (1 << failures.clamp(0, 5))).clamp(30, 300)),
+      );
+    }
+    notices.removeWhere(
+      (text) => text != _offlineNotice && transientNetworkFailure(text),
+    );
+    notice = _offlineNotice;
+    for (final task in activities.items.where(
+      (t) =>
+          !t.running && t.scope == a.label && transientNetworkFailure(t.detail),
+    )) {
+      task.state = 'waiting';
+      task.detail = '网络暂不可用，等待自动恢复';
+      task.retryAt = _networkRetry[a.id];
+    }
+    changed();
+    return true;
+  }
+
+  void _networkRecovered(AccountRef a) {
+    _networkRetry.remove(a.id);
+    _networkFailures.remove(a.id);
+    for (final c in conversations.where((c) => c.accountId == a.id)) {
+      if (_networkChats.remove(c.key)) {
+        _backoff.remove(c.key);
+        _next.remove(c.key);
+        final state = sync[c.key];
+        if (state != null) {
+          state.error = '';
+          state.failures = 0;
+          state.mode = '定时同步';
+        }
+      }
+    }
+    for (final task in activities.items.where(
+      (t) => !t.running && t.scope == a.label && t.detail == '网络暂不可用，等待自动恢复',
+    )) {
+      task.state = 'completed';
+      task.detail = '网络已恢复，同步继续';
+      task.retryAt = null;
+    }
+    if (_networkRetry.isEmpty) notices.remove(_offlineNotice);
+    changed();
+  }
+
   final _pendingChecks = <String>{};
   final _streams = <String>{};
   final blockedConversations = <String>{};
@@ -415,6 +515,7 @@ class Workspace extends ChangeNotifier {
       packages = await store.list('packages');
       selectedAccount = visibleAccounts.firstOrNull?.id;
       outbox = await store.list('outbox');
+      await networkMonitor.start(updateNetworkAvailability);
       startupTrace.mark('workspace.ready');
       ready = true;
       _timer = Timer.periodic(const Duration(seconds: 1), (_) => tick());
@@ -443,6 +544,9 @@ class Workspace extends ChangeNotifier {
   }
 
   Future<RpcClient> client(AccountRef a) async {
+    if (offline) {
+      throw const AppFailure('offline', '当前处于脱机模式，请恢复网络后重试');
+    }
     if (deletedAccountIds.contains(a.id) || _deletingAccounts.contains(a.id)) {
       throw const AppFailure('deleted', '账号正在清理或已删除');
     }
@@ -483,7 +587,7 @@ class Workspace extends ChangeNotifier {
       );
     }
     final process = await Process.start(entry, [], runInShell: false);
-    final rpc = RpcClient(process);
+    final rpc = RpcClient(process, networkAvailable: () => !offline);
     rpc.events.stream.listen((event) => _event(a, event));
     try {
       final result = object(
@@ -917,6 +1021,8 @@ class Workspace extends ChangeNotifier {
         capabilities,
         _backoff,
         _next,
+        _networkRetry,
+        _networkFailures,
         senderProfiles,
         _notificationRefresh,
         _notificationRetry,
@@ -934,6 +1040,7 @@ class Workspace extends ChangeNotifier {
         blockedConversations,
         _historyDone,
         _pendingChecks,
+        _networkChats,
       ]) {
         set.removeWhere(ownedKey);
       }
@@ -1321,7 +1428,9 @@ class Workspace extends ChangeNotifier {
             DateTime.now().millisecondsSinceEpoch;
     BackgroundActivity? currentActivity;
     try {
-      while (queue.isNotEmpty && !closing) {
+      while (queue.isNotEmpty &&
+          !closing &&
+          !_networkRetry.containsKey(accountId)) {
         final conversationId = queue.values.first.conversationId;
         final entries = queue.entries
             .where((e) => e.value.conversationId == conversationId)
@@ -1374,7 +1483,9 @@ class Workspace extends ChangeNotifier {
           returned = (response['items'] as List? ?? []).map(object).toList();
           lookupSucceeded = true;
         } catch (e) {
-          notice = '联系人资料暂不可用，将自动重试：$e';
+          if (!_networkFailed(account(accountId), e)) {
+            notice = '联系人资料暂不可用，将自动重试：$e';
+          }
           activity.finish(
             state: 'failed',
             detail: '$e',
@@ -1399,7 +1510,9 @@ class Workspace extends ChangeNotifier {
             try {
               avatarPath = await cachedAttachment(missing[id]!, resource);
             } catch (e) {
-              notice = '联系人头像暂不可用，将自动重试：$e';
+              if (!_networkFailed(account(accountId), e)) {
+                notice = '联系人头像暂不可用，将自动重试：$e';
+              }
             }
           }
           final hasFile = validSenderAvatarPath(accountId, avatarPath);
@@ -1430,7 +1543,9 @@ class Workspace extends ChangeNotifier {
       changed();
     } catch (e) {
       currentActivity?.finish(state: 'failed', detail: '$e');
-      notice = '联系人资料更新失败：$e';
+      if (!_networkFailed(account(accountId), e)) {
+        notice = '联系人资料更新失败：$e';
+      }
       changed();
     } finally {
       _resolvingSenders.remove(accountId);
@@ -1684,6 +1799,18 @@ class Workspace extends ChangeNotifier {
         activity?.finish(state: 'waiting', detail: state.error);
         return;
       }
+      if (_networkFailed(account(c.accountId), e)) {
+        _networkChats.add(c.key);
+        state.error = '网络暂不可用，等待自动恢复';
+        state.mode = '等待网络';
+        _backoff[c.key] = _networkRetry[c.accountId]!;
+        activity?.finish(
+          state: 'waiting',
+          detail: state.error,
+          retryAt: _backoff[c.key],
+        );
+        return;
+      }
       state.failures++;
       state.error = '$e';
       state.mode = e is AppFailure && e.code == 'authorization'
@@ -1716,7 +1843,7 @@ class Workspace extends ChangeNotifier {
       .length;
 
   void tick({DateTime? at}) {
-    if (closing || _deletingAccounts.isNotEmpty) return;
+    if (closing || offline || _deletingAccounts.isNotEmpty) return;
     final now = at ?? DateTime.now();
     for (final platform in accounts.map((a) => a.platform).toSet()) {
       _tickPlatform(platform, now);
@@ -1737,6 +1864,7 @@ class Workspace extends ChangeNotifier {
         'account:${a.id}',
         'discover:${a.id}',
         'active:${a.id}',
+        'network:${a.id}',
       ],
       for (final c in platformConversations) c.key,
     };
@@ -1748,7 +1876,40 @@ class Workspace extends ChangeNotifier {
     bool available(String id) =>
         account(id).enabled &&
         !_updating.contains(account(id).platform) &&
-        (_sendingAccounts[id] ?? 0) == 0;
+        (_sendingAccounts[id] ?? 0) == 0 &&
+        !_networkRetry.containsKey(id);
+    // One read-only recovery request per affected account; never retry sends.
+    for (final a in platformAccounts.where(
+      (a) => a.enabled && _networkRetry.containsKey(a.id),
+    )) {
+      final probe = 'network:${a.id}';
+      if (_networkRetry[a.id]!.isAfter(now) ||
+          _busy.contains(probe) ||
+          _updating.contains(platform) ||
+          (_sendingAccounts[a.id] ?? 0) > 0 ||
+          pending() >= 3) {
+        continue;
+      }
+      _busy.add(probe);
+      (() async {
+        try {
+          if (repositories.containsKey(platform)) {
+            await refreshActiveConversations(a, at: now);
+          } else {
+            await refreshConversations(a);
+          }
+          _networkRecovered(a);
+        } catch (e) {
+          if (!_networkFailed(a, e, at: now)) {
+            _networkRecovered(a);
+            notice = '${a.label}：$e';
+          }
+        } finally {
+          _busy.remove(probe);
+          changed();
+        }
+      })();
+    }
     for (final a in platformAccounts.where((a) => available(a.id))) {
       final key = 'account:${a.id}';
       if (due(key) && !_busy.contains('discover:${a.id}') && pending() < 4) {
@@ -1762,7 +1923,7 @@ class Workspace extends ChangeNotifier {
         refreshConversations(a)
             .catchError((Object e) {
               _next[key] = now.add(const Duration(seconds: 30));
-              notice = '${a.label}：$e';
+              if (!_networkFailed(a, e, at: now)) notice = '${a.label}：$e';
               changed();
             })
             .whenComplete(() => _busy.remove(key));
@@ -1778,7 +1939,9 @@ class Workspace extends ChangeNotifier {
               await refreshConversations(a, more: true);
             })()
             .catchError((Object e) {
-              notice = '${a.label} 会话发现稍后重试：$e';
+              if (!_networkFailed(a, e, at: now)) {
+                notice = '${a.label} 会话发现稍后重试：$e';
+              }
               changed();
             })
             .whenComplete(() => _busy.remove(moreKey));
@@ -1795,7 +1958,9 @@ class Workspace extends ChangeNotifier {
       _next[key] = now.add(const Duration(seconds: 15));
       refreshActiveConversations(a, at: now)
           .catchError((Object e) {
-            notice = '${a.label} 活跃会话查询稍后重试：$e';
+            if (!_networkFailed(a, e, at: now)) {
+              notice = '${a.label} 活跃会话查询稍后重试：$e';
+            }
             changed();
           })
           .whenComplete(() => _busy.remove(key));
@@ -2204,6 +2369,7 @@ class Workspace extends ChangeNotifier {
 
   Future<void> close() async {
     closing = true;
+    networkMonitor.dispose();
     _timer?.cancel();
     await Future.wait(clients.values.map((c) => c.close()));
     clients.clear();

@@ -117,6 +117,7 @@ class _MessagesPageState extends ConsumerState<MessagesPage> {
   final compose = TextEditingController(), filter = TextEditingController();
   Message? reply;
   bool sending = false, showAgent = false, markdown = false;
+  bool showBlacklisted = false;
   String? attachment, lastConversation;
   @override
   void dispose() {
@@ -154,6 +155,7 @@ class _MessagesPageState extends ConsumerState<MessagesPage> {
             .where(
               (c) =>
                   w.visibleAccounts.any((a) => a.id == c.accountId) &&
+                  w.isConversationExcluded(c) == showBlacklisted &&
                   (w.selectedAccount == null ||
                       c.accountId == w.selectedAccount) &&
                   c.title.toLowerCase().contains(filter.text.toLowerCase()),
@@ -196,6 +198,21 @@ class _MessagesPageState extends ConsumerState<MessagesPage> {
                       },
                     ),
                     const SizedBox(height: 12),
+                    SizedBox(
+                      width: double.infinity,
+                      child: SegmentedButton<bool>(
+                        segments: const [
+                          ButtonSegment(value: false, label: Text('正常会话')),
+                          ButtonSegment(value: true, label: Text('黑名单')),
+                        ],
+                        selected: {showBlacklisted},
+                        showSelectedIcon: false,
+                        onSelectionChanged: (values) => setState(() {
+                          showBlacklisted = values.single;
+                        }),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
                     TextField(
                       controller: filter,
                       onChanged: (_) => setState(() {}),
@@ -236,7 +253,15 @@ class _MessagesPageState extends ConsumerState<MessagesPage> {
               ),
               Expanded(
                 child: conversations.isEmpty
-                    ? const Center(child: Text('登录后刷新会话列表'))
+                    ? Center(
+                        child: Text(
+                          filter.text.isNotEmpty
+                              ? '没有匹配的会话'
+                              : showBlacklisted
+                              ? '暂无黑名单会话'
+                              : '暂无正常会话，可刷新会话列表',
+                        ),
+                      )
                     : ListView.builder(
                         itemCount: conversations.length,
                         itemBuilder: (context, index) {

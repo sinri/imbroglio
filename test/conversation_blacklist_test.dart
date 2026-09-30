@@ -100,7 +100,7 @@ void main() {
   );
 
   testWidgets(
-    'excluded conversation remains visible, searchable and fetches on click',
+    'excluded conversation is searchable and opens from blacklist tab',
     (tester) async {
       await exclude();
       await tester.binding.setSurfaceSize(const Size(1120, 740));
@@ -113,6 +113,9 @@ void main() {
           ),
         ),
       );
+      expect(find.text('通知群'), findsNothing);
+      await tester.tap(find.text('黑名单'));
+      await tester.pumpAndSettle();
       expect(find.text('通知群'), findsOneWidget);
       final search = find.byWidgetPredicate(
         (v) => v is TextField && v.decoration?.hintText == '筛选会话',
@@ -202,6 +205,9 @@ void main() {
       await tester.pumpAndSettle();
       expect(w.isConversationExcluded(chat), isTrue);
       expect(w.conversationBlacklist, hasLength(1));
+      expect(find.text('通知群'), findsNothing);
+      await tester.tap(find.text('黑名单'));
+      await tester.pumpAndSettle();
       expect(find.text('通知群'), findsOneWidget);
       expect(calls, isEmpty);
       await rightClick();
@@ -215,6 +221,48 @@ void main() {
       expect(tester.takeException(), isNull);
     },
   );
+
+  testWidgets('list switch filters conversations and reacts to rule removal', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(1120, 740));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    w.conversations.add(
+      const Conversation(accountId: 'a', id: 'normal', title: '项目群'),
+    );
+    await exclude();
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [workspaceProvider.overrideWith((ref) => w)],
+        child: MaterialApp(
+          home: Scaffold(body: MessagesPage(onSetup: () {})),
+        ),
+      ),
+    );
+    expect(find.text('通知群'), findsNothing);
+    expect(find.text('项目群'), findsOneWidget);
+    await tester.tap(find.text('黑名单'));
+    await tester.pumpAndSettle();
+    expect(find.text('通知群'), findsOneWidget);
+    expect(find.text('项目群'), findsNothing);
+    final search = find.widgetWithText(TextField, '筛选会话');
+    await tester.enterText(search, '项目');
+    await tester.pumpAndSettle();
+    expect(find.text('通知群'), findsNothing);
+    expect(find.text('没有匹配的会话'), findsOneWidget);
+    await tester.enterText(search, '');
+    await tester.pumpAndSettle();
+    expect(find.text('通知群'), findsOneWidget);
+    await tester.runAsync(() => w.saveConversationBlacklist([]));
+    await tester.pumpAndSettle();
+    expect(find.text('暂无黑名单会话'), findsOneWidget);
+    await tester.tap(find.text('正常会话'));
+    await tester.pumpAndSettle();
+    expect(find.text('通知群'), findsOneWidget);
+    expect(find.text('项目群'), findsOneWidget);
+    expect(calls, isEmpty);
+    expect(tester.takeException(), isNull);
+  });
 
   test('new exclusion stops polling without subscription operations', () async {
     await w.syncConversation(chat);

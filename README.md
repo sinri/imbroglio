@@ -75,3 +75,7 @@ python3 tool/package.py
 Copyright © 2026 Sinri Edogawa. All rights reserved.
 
 遇到问题或有改进建议，请前往 [GitHub Issues](https://github.com/sinri/imbroglio/issues) 反馈。
+
+- 临时断网或 DNS 故障时，按账号暂停批量后台同步并合并网络提示，以 30 秒起、最长 5 分钟的指数退避执行单个只读恢复请求；成功后清除提示并从原检查点继续同步，不自动重发消息。
+
+macOS 使用系统 `NWPathMonitor` 在启动和网络变化时检测网络路径；系统报告离线时进入脱机模式，暂停新的 IM 请求，仍可查看缓存。网络路径恢复后自动继续同步，也可点击“尝试恢复”重新检测并提前执行恢复探测；不会自动重发消息。已发出的请求可能继续完成或超时。系统路径可用但 DNS 或服务不可达时仍按账号退避。Windows/Linux 暂保留请求失败后的退避恢复。

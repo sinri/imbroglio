@@ -36,6 +36,9 @@ Future<void> main() async {
               'durationUs': nativeUs,
             });
           }
+          // The native loading window is already visible. Finishing startup
+          // must not reopen it or steal focus after the user switches apps.
+          return;
         }
         await windowManager.show();
         await windowManager.focus();
@@ -48,6 +51,12 @@ Future<void> main() async {
 Future<void> prepareWindow() async {
   if (Platform.isMacOS || Platform.isWindows || Platform.isLinux) {
     await windowManager.ensureInitialized();
+    if (Platform.isMacOS) {
+      // Native startup owns geometry. The generic ready-to-show helper also
+      // restores minimized windows and exits fullscreen, undoing user actions.
+      await windowManager.setTitle('Imbroglio');
+      return;
+    }
     await windowManager.waitUntilReadyToShow(
       const WindowOptions(title: 'Imbroglio'),
     );

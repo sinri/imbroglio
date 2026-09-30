@@ -228,7 +228,9 @@ class _WorkspaceShellState extends ConsumerState<WorkspaceShell> {
                         width: 7,
                         height: 7,
                         decoration: BoxDecoration(
-                          color: w.accounts.any((a) => a.enabled)
+                          color:
+                              !w.waitingForNetwork &&
+                                  w.accounts.any((a) => a.enabled)
                               ? Colors.teal
                               : color.outline,
                           shape: BoxShape.circle,
@@ -236,7 +238,11 @@ class _WorkspaceShellState extends ConsumerState<WorkspaceShell> {
                       ),
                       const SizedBox(width: 8),
                       Text(
-                        '${w.accounts.where((a) => a.enabled).length} 个账号已连接',
+                        w.offline
+                            ? '脱机模式'
+                            : w.waitingForNetwork
+                            ? '等待网络恢复'
+                            : '${w.accounts.where((a) => a.enabled).length} 个账号已连接',
                         style: Theme.of(context).textTheme.bodySmall,
                       ),
                       const SizedBox(width: 20),
@@ -252,6 +258,35 @@ class _WorkspaceShellState extends ConsumerState<WorkspaceShell> {
                   ),
                 ),
                 const Divider(),
+                if (w.waitingForNetwork)
+                  Material(
+                    color: color.surfaceContainerHighest,
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 16,
+                        vertical: 8,
+                      ),
+                      child: Row(
+                        children: [
+                          const Icon(Icons.wifi_off, size: 20),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: Text(
+                              w.offline
+                                  ? '系统网络不可用，已暂停 IM 请求。缓存消息仍可查看，联网后自动恢复。'
+                                  : '网络或消息服务暂不可达，正在自动重试。',
+                            ),
+                          ),
+                          TextButton(
+                            onPressed: w.checkingNetwork
+                                ? null
+                                : w.retryNetwork,
+                            child: Text(w.checkingNetwork ? '正在检测…' : '尝试恢复'),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
                 if (w.notices.isNotEmpty)
                   ErrorNotices(
                     errors: w.notices,

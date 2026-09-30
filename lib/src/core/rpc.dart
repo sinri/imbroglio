@@ -7,6 +7,7 @@ import 'diagnostics.dart';
 /// One JSON-RPC object per line. stdout is exclusively protocol traffic.
 class RpcClient {
   final Process process;
+  final bool Function()? _networkAvailable;
   final _pending = <int, Completer<dynamic>>{};
   final _methods = <int, String>{};
   final events = StreamController<Json>.broadcast();
@@ -15,7 +16,8 @@ class RpcClient {
   bool _exited = false;
   bool _closing = false;
   bool get hasPending => _pending.isNotEmpty;
-  RpcClient(this.process) {
+  RpcClient(this.process, {bool Function()? networkAvailable})
+    : _networkAvailable = networkAvailable {
     process.stdout
         .transform(utf8.decoder)
         .transform(const LineSplitter())
@@ -79,6 +81,11 @@ class RpcClient {
     Json params = const {},
     Duration timeout = const Duration(seconds: 45),
   ]) async {
+    if (method != 'shutdown' &&
+        method != 'unsubscribe' &&
+        _networkAvailable?.call() == false) {
+      throw const AppFailure('offline', '当前处于脱机模式，请恢复网络后重试');
+    }
     if (_closed || _exited) throw const AppFailure('closed', '插件已关闭');
     final id = ++_sequence;
     final c = Completer<dynamic>();
