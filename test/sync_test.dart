@@ -1305,6 +1305,42 @@ void main() {
   });
 
   test(
+    'legacy extensionless downloads and cache resolve to the actual file',
+    () async {
+      final dir = await Directory.systemTemp.createTemp('legacy-download-');
+      temporaryDirectories.add(dir);
+      w.root = dir.path;
+      final base = '${dir.path}/accounts/a/downloads/resource';
+      await File('$base.jpg').parent.create(recursive: true);
+      await File('$base.jpg').writeAsBytes([1, 2, 3]);
+      const m = Message(
+        accountId: 'a',
+        conversationId: 'c',
+        id: 'm',
+        text: '',
+        timestamp: 1,
+      );
+      var calls = 0;
+      w.clients['a'] = FakeRpc((method, args) {
+        calls++;
+        return {'path': base};
+      });
+      expect(await w.cachedAttachment(m, 'img_test'), '$base.jpg');
+      expect(calls, 1);
+      final key = compositeKey(m.key, 'img_test');
+      await w.store.put('attachments', key, {'path': base}, account: 'a');
+      expect(await w.cachedAttachment(m, 'img_test'), '$base.jpg');
+      expect(calls, 1);
+      expect((await w.store.get('attachments', key))!['path'], '$base.jpg');
+      await File('$base.jpg').delete();
+      await expectLater(
+        w.cachedAttachment(m, 'img_test'),
+        throwsA(isA<AppFailure>()),
+      );
+    },
+  );
+
+  test(
     'DingTalk avatar media is downloaded and cached inside the account',
     () async {
       final dir = await Directory.systemTemp.createTemp('imbroglio-avatar-');

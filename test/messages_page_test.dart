@@ -65,6 +65,70 @@ void main() {
     await tester.pumpAndSettle();
   }
 
+  testWidgets('recalled cached media never loads or offers a retry', (
+    tester,
+  ) async {
+    await w.store.saveMessage(
+      const Message(
+        accountId: 'a',
+        conversationId: 'c',
+        id: 'recalled',
+        text: '[Invalid text JSON]',
+        kind: 'image',
+        timestamp: 1,
+        extra: {
+          'raw': {'deleted': true, 'image_key': 'img_old'},
+        },
+      ),
+    );
+    var calls = 0;
+    w.clients['a'] = FakeRpc((method, args) {
+      calls++;
+      return {};
+    });
+    await open(tester);
+    expect(find.text('消息已撤回'), findsOneWidget);
+    expect(find.textContaining('点击重新读取'), findsNothing);
+    expect(find.byTooltip('下载附件'), findsNothing);
+    expect(find.byTooltip('复制消息'), findsNothing);
+    expect(calls, 0);
+  });
+
+  testWidgets('invalid cached text can be reread and persisted', (
+    tester,
+  ) async {
+    const old = Message(
+      accountId: 'a',
+      conversationId: 'c',
+      id: 'broken',
+      text: '[Invalid text JSON]',
+      timestamp: 1,
+    );
+    await w.store.saveMessage(old);
+    var reads = 0;
+    w.clients['a'] = FakeRpc((method, args) {
+      expect(method, 'message.read');
+      reads++;
+      return {...old.toJson(), 'text': '恢复后的正文'};
+    });
+    await open(tester);
+    expect(find.text('[Invalid text JSON]'), findsNothing);
+    await tester.tap(find.text('消息内容暂不可用，点击重新读取'));
+    await tester.runAsync(
+      () => Future<void>.delayed(const Duration(milliseconds: 100)),
+    );
+    await tester.pumpAndSettle();
+    expect(reads, 1);
+    expect(find.text('恢复后的正文'), findsOneWidget);
+    final saved = await w.store.list(
+      'messages',
+      account: 'a',
+      conversation: 'c',
+    );
+    expect(Message.fromJson(saved.single).text, '恢复后的正文');
+    expect(tester.takeException(), isNull);
+  });
+
   test('message groups respect sender, time and date boundaries', () {
     Message row(String sender, DateTime time) => Message(
       accountId: 'a',
@@ -534,56 +598,69 @@ void main() {
     },
   );
 
-  testWidgets(
-    'cached text markers render multiple images while preserving surrounding text',
-    (tester) async {
-      final file = (await tester.runAsync<File>(() async {
-        final dir = await Directory.systemTemp.createTemp('imbroglio-inline-');
-        temporaryDirectories.add(dir);
-        w.root = dir.path;
-        final file = File('${dir.path}/accounts/a/downloads/image.png');
-        await file.parent.create(recursive: true);
-        await File('assets/tray.png').copy(file.path);
-        return file;
-      }))!;
-      final resources = <String>[];
-      w.clients['a'] = FakeRpc((method, args) {
-        expect(method, 'attachment.download');
-        expect(object(args['message'])['id'], 'images');
-        resources.add(args['resourceId'] as String);
-        return {'path': file.path};
-      });
-      await w.store.saveMessage(
-        const Message(
-          accountId: 'a',
-          conversationId: 'c',
-          id: 'images',
-          text: '前文[图片消息](mediaId=%40one)中间[图片消息](mediaId=two)后文',
-          timestamp: 1,
-        ),
-      );
-      await open(tester);
-      await tester.runAsync(
-        () => Future<void>.delayed(const Duration(milliseconds: 100)),
-      );
-      await tester.pumpAndSettle();
-      expect(resources, containsAll(['@one', 'two']));
-      expect(find.text('前文'), findsOneWidget);
-      expect(find.text('中间'), findsOneWidget);
-      expect(find.text('后文'), findsOneWidget);
-      final body = find.byType(MessageContent);
-      expect(
-        find.descendant(of: body, matching: find.byType(Image)),
-        findsNWidgets(2),
-      );
-      expect(find.textContaining('[图片消息]'), findsNothing);
-      expect(
-        find.descendant(of: body, matching: find.byType(Scrollable)),
-        findsNothing,
-      );
-      expect(tester.takeException(), isNull);
-    },
-  );
+  for (final feishu in [false, true, null]) {
+    testWidgets(
+      'cached text markers (Feishu: $feishu) render multiple images while preserving surrounding text',
+      (tester) async {
+        final file = (await tester.runAsync<File>(() async {
+          final dir = await Directory.systemTemp.createTemp(
+            'imbroglio-inline-',
+          );
+          temporaryDirectories.add(dir);
+          w.root = dir.path;
+          final file = File('${dir.path}/accounts/a/downloads/image.png');
+          await file.parent.create(recursive: true);
+          await File('assets/tray.png').copy(file.path);
+          return file;
+        }))!;
+        final resources = <String>[];
+        w.clients['a'] = FakeRpc((method, args) {
+          expect(method, 'attachment.download');
+          expect(object(args['message'])['id'], 'images');
+          resources.add(args['resourceId'] as String);
+          return {'path': file.path};
+        });
+        await w.store.saveMessage(
+          Message(
+            accountId: 'a',
+            conversationId: 'c',
+            id: 'images',
+            text: feishu == null
+                ? '前文[Image: img_one]中间[Image: img_two]后文'
+                : feishu
+                ? '前文![Image](img_one)中间![Image](img_two)后文'
+                : '前文[图片消息](mediaId=%40one)中间[图片消息](mediaId=two)后文',
+            timestamp: 1,
+          ),
+        );
+        await open(tester);
+        await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 100)),
+        );
+        await tester.pumpAndSettle();
+        expect(
+          resources,
+          containsAll(
+            feishu != false ? ['img_one', 'img_two'] : ['@one', 'two'],
+          ),
+        );
+        expect(find.text('前文'), findsOneWidget);
+        expect(find.text('中间'), findsOneWidget);
+        expect(find.text('后文'), findsOneWidget);
+        final body = find.byType(MessageContent);
+        expect(
+          find.descendant(of: body, matching: find.byType(Image)),
+          findsNWidgets(2),
+        );
+        expect(find.textContaining('[图片消息]'), findsNothing);
+        expect(
+          find.descendant(of: body, matching: find.byType(Scrollable)),
+          findsNothing,
+        );
+        expect(tester.takeException(), isNull);
+      },
+    );
+  }
 
   testWidgets('failed inline image can be retried', (tester) async {
     final file = (await tester.runAsync<File>(() async {
@@ -875,34 +952,44 @@ void main() {
     },
   );
 
-  testWidgets(
-    'file attachment displays a named card with size and save action',
-    (tester) async {
-      await w.store.saveMessage(
-        const Message(
-          accountId: 'a',
-          conversationId: 'c',
-          id: 'file',
-          text: '',
-          timestamp: 1000,
-          kind: 'file',
-          extra: {
-            'raw': {
-              'body': {
-                'content':
-                    '{"file_key":"key","file_name":"报告.pdf","file_size":2048}',
+  for (final cachedKind in ['file', 'text', 'rendered', 'dingtalk']) {
+    testWidgets(
+      'file attachment ($cachedKind) displays a named card with size and save action',
+      (tester) async {
+        await w.store.saveMessage(
+          Message(
+            accountId: 'a',
+            conversationId: 'c',
+            id: 'file',
+            text: '',
+            timestamp: 1000,
+            kind: ['rendered', 'dingtalk'].contains(cachedKind)
+                ? 'text'
+                : cachedKind,
+            extra: {
+              'raw': {
+                'msg_type': 'file',
+                'body': {
+                  'content': cachedKind == 'dingtalk'
+                      ? '[文件] 报告.pdf fileId: opaque 注意：如需下载使用dws drive download命令下载'
+                      : cachedKind == 'rendered'
+                      ? '<file key="file_report" name="报告.pdf" size="2048"/>'
+                      : '{"file_key":"key","file_name":"报告.pdf","file_size":2048}',
+                },
               },
             },
-          },
-        ),
-      );
-      await open(tester);
-      expect(find.text('报告.pdf'), findsOneWidget);
-      expect(find.text('2.0 KB'), findsOneWidget);
-      expect(find.byTooltip('保存文件'), findsOneWidget);
-      expect(tester.takeException(), isNull);
-    },
-  );
+          ),
+        );
+        await open(tester);
+        expect(find.text('报告.pdf'), findsOneWidget);
+        if (cachedKind != 'dingtalk') {
+          expect(find.text('2.0 KB'), findsOneWidget);
+        }
+        expect(find.byTooltip('保存文件'), findsOneWidget);
+        expect(tester.takeException(), isNull);
+      },
+    );
+  }
 
   testWidgets('failed send stays in its message row without a snackbar', (
     tester,

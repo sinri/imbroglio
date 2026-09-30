@@ -10,17 +10,18 @@ class MessagePresentation {
 }
 
 const _formattedTypes = {'markdown', 'md', 'post', 'richtext', 'rich_text'};
-const _typeKeys = ['message_type', 'msgType', 'msgtype', 'messageType', 'type'];
+const _typeKeys = messageTypeKeys;
 const _bodyKeys = ['content', 'text', 'body', 'msgContent'];
 
 MessagePresentation messagePresentation(Message message) {
-  if (!{'text', '', ..._formattedTypes}.contains(message.kind)) {
+  if (messageRecalled(message)) return const MessagePresentation('消息已撤回');
+  if (!{'text', '', ..._formattedTypes}.contains(messageKind(message))) {
     return MessagePresentation(message.text);
   }
   var raw = object(message.extra['raw']);
   if (raw['message'] is Map) raw = {...raw, ...object(raw['message'])};
   final typed =
-      _formattedTypes.contains(message.kind) ||
+      _formattedTypes.contains(messageKind(message)) ||
       _formattedTypes.contains(field(raw, _typeKeys).toLowerCase());
   final formatted = _formattedBody(raw, 0, typed);
   if (formatted != null && formatted.isNotEmpty) {

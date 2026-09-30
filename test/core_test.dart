@@ -6,6 +6,70 @@ import 'package:imbroglio/src/core/normalize.dart';
 import 'package:imbroglio/src/services/agent.dart';
 
 void main() {
+  test(
+    'DingTalk drive files render from cached text without using quoted IDs',
+    () {
+      const content =
+          '[文件] report.md fileId: opaque-123 注意：如需下载使用dws drive download命令下载';
+      final m = normalizeMessage('a', 'c', {
+        'messageId': 'm',
+        'content': content,
+      });
+      expect(messageKind(m), 'file');
+      expect(findResourceId(m.extra['raw']), 'opaque-123');
+      expect(attachmentDetails(m.extra['raw'])['name'], 'report.md');
+      expect(
+        findResourceId({
+          'quotedMessage': {'content': content},
+          'text': '回复',
+        }),
+        isEmpty,
+      );
+      expect(
+        dingTalkFileDetails({
+          'content': {'fileId': 'id', 'fileName': 'a.pdf', 'spaceId': 'space'},
+        })['spaceId'],
+        'space',
+      );
+    },
+  );
+
+  test('legacy Feishu image markers expose a downloadable resource', () {
+    const content = '[Image: img_v3_example]';
+    expect(messageImageReferences(content).single.resourceId, 'img_v3_example');
+    expect(findResourceId({'content': content}), 'img_v3_example');
+  });
+
+  test('Feishu rendered image and file markers retain resource metadata', () {
+    const text = '前文![Image](img_v3_one)中间![图](img_v3_two)后文';
+    final refs = messageImageReferences(text);
+    expect(refs.map((r) => r.resourceId), ['img_v3_one', 'img_v3_two']);
+    expect(findResourceId({'content': text}), 'img_v3_one');
+    expect(
+      messageImageReferences('![external](https://example.com/a.png)'),
+      isEmpty,
+    );
+    const file =
+        '<file key="file_v3_report" name="报告 &amp; 附件.pdf" size="2048"/>';
+    expect(findResourceId({'content': file}), 'file_v3_report');
+    expect(attachmentDetails({'content': file})['name'], '报告 & 附件.pdf');
+    expect(attachmentDetails({'content': file})['size'], 2048);
+  });
+
+  test('Feishu CLI message types work for new and cached attachments', () {
+    for (final kind in ['image', 'file', 'post']) {
+      final message = normalizeMessage('account', 'chat', {
+        'message_id': 'om_test',
+        'msg_type': kind,
+      });
+      expect(message.kind, kind);
+      expect(
+        messageKind(Message.fromJson({...message.toJson(), 'kind': 'text'})),
+        kind,
+      );
+    }
+  });
+
   test('quoted images are not attachments of the current message', () {
     final raw = {
       'text': '当前消息只有文字',

@@ -183,6 +183,32 @@ Conversation normalizeConversation(String account, Json j) {
   );
 }
 
+const messageTypeKeys = [
+  'message_type',
+  'msg_type',
+  'msgType',
+  'msgtype',
+  'messageType',
+  'type',
+];
+
+/// Recover message types missed by older versions when reading cached history.
+String messageKind(Message message) {
+  if (dingTalkFileDetails(message.extra['raw']).isNotEmpty) return 'file';
+  if (message.kind != 'text' && message.kind.isNotEmpty) return message.kind;
+  var raw = object(message.extra['raw']);
+  if (raw['message'] is Map) raw = {...raw, ...object(raw['message'])};
+  return field(raw, messageTypeKeys, message.kind).toLowerCase();
+}
+
+/// Feishu exposes an explicit deleted flag for recalled messages.
+/// A parsing-error placeholder alone is not evidence of recall.
+bool messageRecalled(Message message) {
+  var raw = object(message.extra['raw']);
+  if (raw['message'] is Map) raw = {...raw, ...object(raw['message'])};
+  return raw['deleted'] == true;
+}
+
 Message normalizeMessage(String account, String conversation, Json input) {
   var j = input;
   if (j['message'] is Map) j = {...j, ...object(j['message'])};
@@ -203,9 +229,11 @@ Message normalizeMessage(String account, String conversation, Json input) {
       'conversationId',
     ], conversation),
     id: id,
-    text: richMessageText(
-      j['content'] ?? j['text'] ?? j['body'] ?? j['msgContent'],
-    ),
+    text: j['deleted'] == true
+        ? '消息已撤回'
+        : richMessageText(
+            j['content'] ?? j['text'] ?? j['body'] ?? j['msgContent'],
+          ),
     timestamp: messageTimestamp(j),
     sender: field(
       j,
@@ -220,7 +248,7 @@ Message normalizeMessage(String account, String conversation, Json input) {
       'senderId',
       'senderOpenDingTalkId',
     ], field(sender, ['id', 'open_id'])),
-    kind: field(j, ['message_type', 'msgType', 'type'], 'text').toLowerCase(),
+    kind: field(j, messageTypeKeys, 'text').toLowerCase(),
     extra: {
       'raw': j,
       'avatar': avatarUrl(
@@ -256,14 +284,14 @@ class MessageImageReference {
 }
 
 final _messageImagePattern = RegExp(
-  r'\[图片消息\]\(\s*mediaId\s*=\s*([^\s)]+)\s*\)',
+  r'\[图片消息\]\(\s*mediaId\s*=\s*([^\s)]+)\s*\)|!\[[^\]\n]*\]\(\s*(img_[^\s)]+)\s*\)|\[Image:\s*(img_[^\s\]]+)\s*\]',
 );
 
 List<MessageImageReference> messageImageReferences(String text) =>
     _messageImagePattern
         .allMatches(text)
         .map((match) {
-          var id = match.group(1)!;
+          var id = (match.group(1) ?? match.group(2) ?? match.group(3))!;
           if (id.length > 1 &&
               ((id.startsWith('"') && id.endsWith('"')) ||
                   (id.startsWith("'") && id.endsWith("'")))) {
@@ -280,12 +308,16 @@ List<MessageImageReference> messageImageReferences(String text) =>
         .toList();
 
 String findResourceId(Object? value, [int depth = 0]) {
+  final drive = dingTalkFileDetails(value, depth);
+  if (drive.isNotEmpty) return drive['fileId'] as String;
   if (depth > 8) return '';
   if (value is String) {
     try {
       return findResourceId(jsonDecode(value), depth + 1);
     } catch (_) {
-      return messageImageReferences(value).firstOrNull?.resourceId ?? '';
+      return messageImageReferences(value).firstOrNull?.resourceId ??
+          _renderedAttachment(value)['key'] as String? ??
+          '';
     }
   }
   if (value is Map) {
@@ -371,14 +403,96 @@ String richMessageText(Object? value, [int depth = 0]) {
   return value?.toString() ?? '';
 }
 
+/// DWS file messages use drive file IDs, which are distinct from media IDs.
+Json dingTalkFileDetails(Object? value, [int depth = 0]) {
+  if (depth > 8) return {};
+  if (value is String) {
+    try {
+      return dingTalkFileDetails(jsonDecode(value), depth + 1);
+    } on FormatException {
+      final match = RegExp(
+        r'^(?:\[文件\]\s*)?(.+?)\s+fileId:\s*([A-Za-z0-9_-]+)(?:\s|$)',
+        dotAll: true,
+      ).firstMatch(value.trim());
+      return match == null
+          ? {}
+          : {'fileId': match.group(2), 'name': match.group(1)!.trim()};
+    }
+  }
+  if (value is Map) {
+    final j = object(value);
+    final id = field(j, ['fileId']);
+    if (id.isNotEmpty) {
+      return {
+        'fileId': id,
+        if (field(j, ['fileName', 'file_name', 'name']).isNotEmpty)
+          'name': field(j, ['fileName', 'file_name', 'name']),
+        if (field(j, ['spaceId']).isNotEmpty) 'spaceId': field(j, ['spaceId']),
+        'size': int.tryParse(field(j, ['fileSize', 'file_size', 'size'])),
+      };
+    }
+    for (final entry in value.entries) {
+      if (const {
+        'quotedMessage',
+        'resourceRefs',
+        'sender',
+        'avatar',
+        'senderAvatar',
+        'avatarUrl',
+        'avatar_url',
+      }.contains(entry.key)) {
+        continue;
+      }
+      final found = dingTalkFileDetails(entry.value, depth + 1);
+      if (found.isNotEmpty) return found;
+    }
+  }
+  if (value is List) {
+    for (final child in value) {
+      final found = dingTalkFileDetails(child, depth + 1);
+      if (found.isNotEmpty) return found;
+    }
+  }
+  return {};
+}
+
+/// Feishu CLI renders file resources as XML-like markers, not JSON bodies.
+Json _renderedAttachment(String text) {
+  final marker = RegExp(
+    r'<(?:file|audio|video)\b[^>]*>',
+    caseSensitive: false,
+  ).firstMatch(text)?.group(0);
+  if (marker == null) return {};
+  final attributes = <String, String>{};
+  for (final match in RegExp(
+    r"""([a-z_]+)\s*=\s*(["'])(.*?)\2""",
+  ).allMatches(marker)) {
+    attributes[match.group(1)!] = match
+        .group(3)!
+        .replaceAll('&quot;', '"')
+        .replaceAll('&apos;', "'")
+        .replaceAll('&lt;', '<')
+        .replaceAll('&gt;', '>')
+        .replaceAll('&amp;', '&');
+  }
+  if (!(attributes['key'] ?? '').startsWith('file_')) return {};
+  return {
+    'key': attributes['key'],
+    if (attributes['name'] != null) 'name': attributes['name'],
+    'size': int.tryParse(attributes['size'] ?? ''),
+  };
+}
+
 /// Attachment metadata may be nested in JSON-encoded message bodies.
 Json attachmentDetails(Object? value, [int depth = 0]) {
+  final drive = dingTalkFileDetails(value, depth);
+  if (drive.isNotEmpty) return drive;
   if (depth > 8) return {};
   if (value is String) {
     try {
       return attachmentDetails(jsonDecode(value), depth + 1);
     } catch (_) {
-      return {};
+      return _renderedAttachment(value);
     }
   }
   if (value is Map) {

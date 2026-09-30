@@ -821,7 +821,8 @@ class _MessagesPageState extends ConsumerState<MessagesPage> {
                                                 ),
                                           ),
                                         ),
-                                      if (m.text.isNotEmpty)
+                                      if (!messageRecalled(m) &&
+                                          m.text.isNotEmpty)
                                         IconButton(
                                           tooltip: '复制消息',
                                           onPressed: () => copyMessage(m.text),
@@ -830,7 +831,8 @@ class _MessagesPageState extends ConsumerState<MessagesPage> {
                                             size: 18,
                                           ),
                                         ),
-                                      if (m.kind != 'file' &&
+                                      if (!messageRecalled(m) &&
+                                          messageKind(m) != 'file' &&
                                           findResourceId(
                                             m.extra['raw'],
                                           ).isNotEmpty)
@@ -1115,7 +1117,7 @@ class _MessagesPageState extends ConsumerState<MessagesPage> {
       await FilePicker.saveFile(
         bytes: await File(path).readAsBytes(),
         fileName: p.basename(
-          '${attachmentDetails(message.extra['raw'])['name'] ?? (message.kind == 'image' ? 'image.png' : 'attachment')}'
+          '${attachmentDetails(message.extra['raw'])['name'] ?? (messageKind(message) == 'image' ? 'image.png' : 'attachment')}'
               .replaceAll('\\', '/'),
         ),
       );

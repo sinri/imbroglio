@@ -600,6 +600,36 @@ class Adapter {
             'next_page_token',
           ]),
         };
+      case 'message.read':
+        if (platform != 'feishu') {
+          throw const AppFailure('unsupported', '当前平台不支持重新读取单条消息');
+        }
+        final message = Message.fromJson(object(args['message']));
+        final value = await run(
+          id,
+          scoped([
+            'api',
+            'GET',
+            '/open-apis/im/v1/messages/${Uri.encodeComponent(message.id)}',
+          ], user: true),
+        );
+        final raw = rows(
+          value,
+        ).where((row) => row['message_id'] == message.id).firstOrNull;
+        if (raw == null) throw const AppFailure('resource', '未返回原始消息内容');
+        final restored = normalizeMessage(
+          accountId,
+          message.conversationId,
+          raw,
+        );
+        if (restored.conversationId != message.conversationId) {
+          throw const AppFailure('identity', '消息会话不匹配');
+        }
+        return Message.fromJson({
+          ...restored.toJson(),
+          'sender': restored.sender.isEmpty ? message.sender : restored.sender,
+          'extra': {...message.extra, ...restored.extra},
+        }).toJson();
       case 'messages':
         final c = object(args['conversation']);
         final older = args['before'] != null;
@@ -791,26 +821,40 @@ class Adapter {
         if (resourceId.isEmpty) {
           throw const AppFailure('resource', '消息未提供可下载资源 ID');
         }
+        final drive = dingTalkFileDetails(object(message['extra'])['raw']);
         final relative = p.join('downloads', newId());
         await Directory(p.join(directory, 'downloads')).create(recursive: true);
-        await run(
+        final downloaded = await run(
           id,
           platform == 'dingtalk'
-              ? scoped([
-                  'chat',
-                  'message',
-                  'download-media',
-                  '--type',
-                  'mediaId',
-                  '--resource-id',
-                  resourceId,
-                  '--message-id',
-                  message['id'],
-                  '--open-conversation-id',
-                  message['conversationId'],
-                  '--output',
-                  relative,
-                ])
+              ? drive['fileId'] == resourceId
+                    ? scoped([
+                        'drive',
+                        'download',
+                        '--node',
+                        resourceId,
+                        if (drive['spaceId'] != null) ...[
+                          '--space-id',
+                          drive['spaceId'],
+                        ],
+                        '--output',
+                        relative,
+                      ])
+                    : scoped([
+                        'chat',
+                        'message',
+                        'download-media',
+                        '--type',
+                        'mediaId',
+                        '--resource-id',
+                        resourceId,
+                        '--message-id',
+                        message['id'],
+                        '--open-conversation-id',
+                        message['conversationId'],
+                        '--output',
+                        relative,
+                      ])
               : scoped([
                   'im',
                   '+messages-resources-download',
@@ -819,12 +863,26 @@ class Adapter {
                   '--file-key',
                   resourceId,
                   '--type',
-                  message['kind'] == 'image' ? 'image' : 'file',
+                  messageKind(Message.fromJson(message)) == 'image'
+                      ? 'image'
+                      : 'file',
                   '--output',
                   relative,
                 ], user: true),
         );
-        return {'path': p.join(directory, relative)};
+        final saved = platform == 'feishu'
+            ? field(object(downloaded), ['saved_path'], relative)
+            : relative;
+        final path = p.normalize(
+          p.isAbsolute(saved) ? saved : p.join(directory, saved),
+        );
+        if (!p.isWithin(p.join(directory, 'downloads'), path)) {
+          throw const AppFailure('path', '附件路径不在账号下载目录');
+        }
+        if (!await File(path).exists()) {
+          throw const AppFailure('resource', '下载完成但未找到附件文件');
+        }
+        return {'path': path};
       case 'conversation.open':
         final contact = object(args['contact']);
         final peer = field(contact, [
@@ -950,6 +1008,7 @@ class Adapter {
       case 'contacts.resolve':
         final ids = (args['ids'] as List? ?? [])
             .whereType<String>()
+            .where((id) => platform != 'feishu' || id.startsWith('ou_'))
             .take(20)
             .toList();
         if (ids.isEmpty) return {'items': []};

@@ -8,6 +8,26 @@ void main() {
   Message message(Map<String, dynamic> raw) =>
       normalizeMessage('a', 'c', {'id': 'm', ...raw});
 
+  test('explicit recall overrides invalid text and old cached bodies', () {
+    final recalled = message({
+      'deleted': true,
+      'content': '[Invalid text JSON]',
+    });
+    expect(recalled.text, '消息已撤回');
+    final cached = Message.fromJson({...recalled.toJson(), 'text': '旧正文'});
+    expect(messagePresentation(cached).text, '消息已撤回');
+    expect(
+      messageRecalled(message({'content': '[Invalid text JSON]'})),
+      isFalse,
+    );
+    expect(
+      messageRecalled(
+        message({'deleted': false, 'content': '[Invalid text JSON]'}),
+      ),
+      isFalse,
+    );
+  });
+
   test('recognizes explicit and nested markdown including old text cache', () {
     for (final key in ['message_type', 'msgType', 'msgtype', 'messageType']) {
       final m = message({

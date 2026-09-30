@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:io';
 import 'package:flutter_test/flutter_test.dart';
 // The standalone adapter resolves shared models with file URIs.
 // ignore: avoid_relative_lib_imports
@@ -35,7 +36,148 @@ class RecordingAdapter extends adapter.Adapter {
   }
 }
 
+class DownloadRecordingAdapter extends RecordingAdapter {
+  DownloadRecordingAdapter() : super('dingtalk');
+  @override
+  Future<dynamic> run(
+    Object id,
+    List<String> args, {
+    String? input,
+    bool raw = false,
+    Duration timeout = const Duration(seconds: 40),
+    bool auth = false,
+  }) async {
+    command = args;
+    final path = '$directory/${args[args.indexOf('--output') + 1]}';
+    await File(path).writeAsString('downloaded');
+    return {};
+  }
+}
+
 void main() {
+  test(
+    'DingTalk fileId attachments use drive download with account profile',
+    () async {
+      final dir = await Directory.systemTemp.createTemp('ding-file-');
+      addTearDown(() => dir.delete(recursive: true));
+      final a = DownloadRecordingAdapter()..directory = dir.path;
+      final m = normalizeMessage('account', 'chat', {
+        'messageId': 'm',
+        'msgType': 'file',
+        'content':
+            '[文件] report.md fileId: file-123 注意：如需下载使用dws drive download命令下载',
+      });
+      final result = object(
+        await a.handle(1, 'attachment.download', {
+          'message': m.toJson(),
+          'resourceId': findResourceId(m.extra['raw']),
+        }),
+      );
+      expect(
+        a.command,
+        containsAllInOrder(['drive', 'download', '--node', 'file-123']),
+      );
+      expect(a.command, containsAllInOrder(['--profile', 'exact-profile']));
+      expect(await File(result['path'] as String).readAsString(), 'downloaded');
+    },
+  );
+
+  test(
+    'Feishu rereads raw content instead of the CLI text placeholder',
+    () async {
+      final a = RecordingAdapter('feishu')
+        ..response = {
+          'items': [
+            {
+              'message_id': 'om_test',
+              'chat_id': 'chat',
+              'msg_type': 'text',
+              'body': {'content': '{"text":"恢复的消息"}'},
+            },
+          ],
+        };
+      final old = normalizeMessage('account', 'chat', {
+        'message_id': 'om_test',
+        'sender_name': 'Alice',
+        'content': '[Invalid text JSON]',
+      });
+      final result = Message.fromJson(
+        object(await a.handle(1, 'message.read', {'message': old.toJson()})),
+      );
+      expect(result.text, '恢复的消息');
+      expect(result.sender, 'Alice');
+      expect(result.key, old.key);
+      expect(
+        a.command,
+        containsAllInOrder(['api', 'GET', '/open-apis/im/v1/messages/om_test']),
+      );
+    },
+  );
+  test('Feishu does not query non-user sender IDs', () async {
+    final a = RecordingAdapter('feishu');
+    final result = object(
+      await a.handle(1, 'contacts.resolve', {
+        'ids': ['cli_bot', 'unknown'],
+      }),
+    );
+    expect(result['items'], isEmpty);
+    expect(a.command, isEmpty);
+    await a.handle(2, 'contacts.resolve', {
+      'ids': ['cli_bot', 'ou_user'],
+    });
+    expect(a.command, containsAllInOrder(['--user-ids', 'ou_user']));
+  });
+
+  for (final kind in ['image', 'file']) {
+    test('Feishu $kind downloads use the actual saved path', () async {
+      final dir = await Directory.systemTemp.createTemp('attachment-test-');
+      addTearDown(() => dir.delete(recursive: true));
+      final saved = 'downloads/resource.${kind == 'image' ? 'png' : 'pdf'}';
+      await Directory('${dir.path}/downloads').create();
+      await File('${dir.path}/$saved').writeAsBytes([1, 2, 3]);
+      final a = RecordingAdapter('feishu')
+        ..directory = dir.path
+        ..response = {'saved_path': saved};
+      final message = normalizeMessage('account', 'chat', {
+        'message_id': 'om_test',
+        'msg_type': kind,
+        'content': kind == 'image'
+            ? {'image_key': 'img_test'}
+            : {'file_key': 'file_test', 'file_name': 'report.pdf'},
+      });
+      final result = object(
+        await a.handle(1, 'attachment.download', {
+          // Simulate a message cached before msg_type was recognized.
+          'message': {...message.toJson(), 'kind': 'text'},
+          'resourceId': findResourceId(message.extra['raw']),
+        }),
+      );
+      expect(result['path'], '${dir.path}/$saved');
+      expect(a.command, containsAllInOrder(['--type', kind]));
+      expect(a.command, containsAllInOrder(['--message-id', 'om_test']));
+    });
+  }
+  test(
+    'attachment download rejects paths outside the account downloads',
+    () async {
+      final dir = await Directory.systemTemp.createTemp('attachment-test-');
+      addTearDown(() => dir.delete(recursive: true));
+      final a = RecordingAdapter('feishu')
+        ..directory = dir.path
+        ..response = {'saved_path': '../outside.pdf'};
+      await expectLater(
+        a.handle(1, 'attachment.download', {
+          'message': normalizeMessage('account', 'chat', {
+            'message_id': 'om_test',
+            'msg_type': 'file',
+          }).toJson(),
+          'resourceId': 'file_test',
+        }),
+        throwsA(isA<AppFailure>()),
+      );
+    },
+  );
+
   test(
     'DingTalk self identity matches exact user ID despite duplicate names',
     () async {

@@ -2222,18 +2222,41 @@ class Workspace extends ChangeNotifier {
     await selectConversation(c);
   }
 
+  Future<void> reloadMessage(Message message) async {
+    final result = await (await client(
+      account(message.accountId),
+    )).call('message.read', {'message': message.toJson()});
+    final restored = Message.fromJson(object(result));
+    if (restored.key != message.key ||
+        restored.conversationId != message.conversationId) {
+      throw const AppFailure('identity', '返回的消息身份不匹配');
+    }
+    if (restored.text.trim() == '[Invalid text JSON]') {
+      throw const AppFailure('resource', '原始消息仍无法解析');
+    }
+    if (deletedAccountIds.contains(message.accountId) ||
+        _deletingAccounts.contains(message.accountId)) {
+      return;
+    }
+    await store.saveMessage(restored);
+    await loadMessages();
+  }
+
   Future<String> cachedAttachment(Message message, String resourceId) async {
     final key = compositeKey(message.key, resourceId);
     final task = _attachments.putIfAbsent(key, () async {
       final saved = await store.get('attachments', key);
       final path = saved?['path'] as String?;
-      if (path != null &&
-          p.isWithin(
-            p.join(root, 'accounts', message.accountId, 'downloads'),
-            p.normalize(path),
-          ) &&
-          await File(path).exists()) {
-        return path;
+      if (path != null) {
+        final existing = await _existingAttachment(message, path);
+        if (existing != null) {
+          if (existing != path) {
+            await store.put('attachments', key, {
+              'path': existing,
+            }, account: message.accountId);
+          }
+          return existing;
+        }
       }
       final result = await downloadAttachment(message, resourceId);
       await store.put('attachments', key, {
@@ -2256,6 +2279,27 @@ class Workspace extends ChangeNotifier {
         (_) => _downloadAttachment(message, resourceId),
       );
 
+  // Older adapters returned the requested basename even when the CLI appended
+  // an extension. Recover only a unique matching file inside this account.
+  Future<String?> _existingAttachment(Message message, String path) async {
+    final folder = p.join(root, 'accounts', message.accountId, 'downloads');
+    path = p.normalize(path);
+    if (!p.isWithin(folder, path)) return null;
+    if (await File(path).exists()) return path;
+    if (p.extension(path).isNotEmpty ||
+        !await Directory(p.dirname(path)).exists()) {
+      return null;
+    }
+    final candidates = await Directory(p.dirname(path))
+        .list(followLinks: false)
+        .where(
+          (entry) => entry is File && p.withoutExtension(entry.path) == path,
+        )
+        .map((entry) => entry.path)
+        .toList();
+    return candidates.length == 1 ? candidates.single : null;
+  }
+
   Future<String> _downloadAttachment(Message message, String resourceId) async {
     final result = object(
       await (await client(account(message.accountId))).call(
@@ -2270,7 +2314,11 @@ class Workspace extends ChangeNotifier {
     )) {
       throw const AppFailure('path', '附件路径不在账号下载目录');
     }
-    return file;
+    final existing = await _existingAttachment(message, file);
+    if (existing == null) {
+      throw const AppFailure('resource', '图片或附件文件不存在，请重新下载');
+    }
+    return existing;
   }
 
   Future<void> updatePlugin(

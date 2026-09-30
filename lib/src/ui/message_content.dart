@@ -25,11 +25,33 @@ class MessageContent extends ConsumerStatefulWidget {
 
 class _MessageContentState extends ConsumerState<MessageContent> {
   bool expanded = false;
+  bool reloading = false;
   @override
   Widget build(BuildContext context) {
     final m = widget.message;
+    if (messageRecalled(m)) return const Text('消息已撤回');
+    if (m.text.trim() == '[Invalid text JSON]' &&
+        ref.read(workspaceProvider).account(m.accountId).platform == 'feishu') {
+      return TextButton.icon(
+        icon: const Icon(Icons.refresh),
+        label: Text(reloading ? '正在重新读取…' : '消息内容暂不可用，点击重新读取'),
+        onPressed: reloading
+            ? null
+            : () async {
+                setState(() => reloading = true);
+                try {
+                  await guarded(
+                    context,
+                    () => ref.read(workspaceProvider).reloadMessage(m),
+                  );
+                } finally {
+                  if (mounted) setState(() => reloading = false);
+                }
+              },
+      );
+    }
     final resource = findResourceId(m.extra['raw']);
-    final imageMessage = ['image', 'picture', '2'].contains(m.kind);
+    final imageMessage = ['image', 'picture', '2'].contains(messageKind(m));
     final presentation = messagePresentation(m);
     final text = presentation.text;
     final references = messageImageReferences(text);
@@ -65,7 +87,7 @@ class _MessageContentState extends ConsumerState<MessageContent> {
     if (imageMessage && resource.isNotEmpty) {
       return _InlineMessageImage(message: m, resourceId: resource);
     }
-    if (m.kind == 'file') {
+    if (messageKind(m) == 'file') {
       final details = attachmentDetails(m.extra['raw']);
       final name = '${details['name'] ?? (m.text.isEmpty ? '文件附件' : m.text)}';
       final size = details['size'] as int?;
@@ -167,14 +189,14 @@ class _MessageContentState extends ConsumerState<MessageContent> {
         },
       );
     }
-    final kind = switch (m.kind) {
+    final kind = switch (messageKind(m)) {
       'file' => '文件',
       'audio' || 'voice' => '语音',
       'video' || 'media' => '视频',
       'interactive' || 'card' => '卡片（内容摘要）',
       'sticker' => '表情',
       'text' => '',
-      _ => '暂不支持完整展示的消息：${m.kind}',
+      _ => '暂不支持完整展示的消息：${messageKind(m)}',
     };
     return Text(
       [
@@ -245,7 +267,13 @@ class _InlineMessageImageState extends ConsumerState<_InlineMessageImage> {
                 child: Stack(
                   children: [
                     InteractiveViewer(
-                      child: Center(child: Image.file(File(snapshot.data!))),
+                      child: Center(
+                        child: Image.file(
+                          File(snapshot.data!),
+                          errorBuilder: (_, _, _) =>
+                              const Text('图片文件不可用，请关闭预览后重试'),
+                        ),
+                      ),
                     ),
                     Positioned(
                       right: 8,
@@ -263,7 +291,14 @@ class _InlineMessageImageState extends ConsumerState<_InlineMessageImage> {
               File(snapshot.data!),
               width: 300,
               fit: BoxFit.contain,
-              errorBuilder: (_, _, _) => const Text('图片格式无法预览，可下载查看'),
+              errorBuilder: (_, _, _) => TextButton.icon(
+                onPressed: () async {
+                  await FileImage(File(snapshot.data!)).evict();
+                  if (mounted) setState(() => image = null);
+                },
+                icon: const Icon(Icons.refresh),
+                label: const Text('图片文件不可用，点击重试'),
+              ),
             ),
           );
         },
