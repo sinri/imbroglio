@@ -12,12 +12,19 @@ import 'app.dart';
 class MessageContent extends ConsumerStatefulWidget {
   final Message message;
   final VoidCallback? onDownload;
-  const MessageContent(this.message, {super.key, this.onDownload});
+  final bool foldLongText;
+  const MessageContent(
+    this.message, {
+    super.key,
+    this.onDownload,
+    this.foldLongText = false,
+  });
   @override
   ConsumerState<MessageContent> createState() => _MessageContentState();
 }
 
 class _MessageContentState extends ConsumerState<MessageContent> {
+  bool expanded = false;
   @override
   Widget build(BuildContext context) {
     final m = widget.message;
@@ -97,6 +104,49 @@ class _MessageContentState extends ConsumerState<MessageContent> {
   }
 
   Widget _renderText(Message m, String text, bool markdown) {
+    if (widget.foldLongText) {
+      return LayoutBuilder(
+        builder: (context, constraints) {
+          final painter = TextPainter(
+            text: TextSpan(
+              text: text,
+              style: const TextStyle(fontSize: 14, height: 1.43),
+            ),
+            textDirection: Directionality.of(context),
+            textScaler: MediaQuery.textScalerOf(context),
+            maxLines: 12,
+          )..layout(maxWidth: constraints.maxWidth);
+          final long = painter.didExceedMaxLines;
+          painter.dispose();
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              if (long && !expanded)
+                Text(
+                  text,
+                  maxLines: 12,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(fontSize: 14, height: 1.43),
+                )
+              else
+                _fullText(m, text, markdown),
+              if (long)
+                SelectionContainer.disabled(
+                  child: TextButton(
+                    onPressed: () => setState(() => expanded = !expanded),
+                    child: Text(expanded ? '收起长消息' : '展开完整消息'),
+                  ),
+                ),
+            ],
+          );
+        },
+      );
+    }
+    return _fullText(m, text, markdown);
+  }
+
+  Widget _fullText(Message m, String text, bool markdown) {
     if (markdown) {
       return MarkdownBody(
         data: text,
@@ -104,6 +154,9 @@ class _MessageContentState extends ConsumerState<MessageContent> {
         builders: {'pre': _WrappingCodeBlock()},
         styleSheet: MarkdownStyleSheet(
           tableColumnWidth: const FlexColumnWidth(),
+          p: const TextStyle(fontSize: 14, height: 1.43),
+          blockSpacing: 6,
+          listIndent: 20,
         ),
         imageBuilder: (_, _, _) => const Text('[图片，请查看消息附件]'),
         onTapLink: (_, href, _) {
@@ -129,7 +182,7 @@ class _MessageContentState extends ConsumerState<MessageContent> {
         if (text.isNotEmpty) text,
         if (text.isEmpty && kind.isEmpty) '[空消息]',
       ].join('\n'),
-      style: const TextStyle(height: 1.6),
+      style: const TextStyle(fontSize: 14, height: 1.43),
     );
   }
 }

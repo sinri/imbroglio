@@ -88,6 +88,8 @@ class Workspace extends ChangeNotifier {
   }
 
   Conversation? selectedConversation;
+  // Preserve the local reading boundary before selecting a chat marks it read.
+  int? selectedUnreadAfter;
   List<AccountRef> accounts = [];
   Iterable<AccountRef> get visibleAccounts =>
       accounts.where((a) => !a.signedOut);
@@ -1228,6 +1230,7 @@ class Workspace extends ChangeNotifier {
 
   Future<void> selectConversation(Conversation c) async {
     if (selectedConversation?.key != c.key) {
+      selectedUnreadAfter = c.unread > 0 ? _readAt[c.key] : null;
       messageLimit = 100;
       messages = [];
     }

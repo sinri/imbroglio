@@ -106,6 +106,23 @@ List<Message> messageTimeline(Workspace w, Conversation c) {
   return messages;
 }
 
+bool continuesMessageGroup(Message previous, Message current) {
+  final a = DateTime.fromMillisecondsSinceEpoch(previous.timestamp);
+  final b = DateTime.fromMillisecondsSinceEpoch(current.timestamp);
+  return previous.accountId == current.accountId &&
+      previous.conversationId == current.conversationId &&
+      previous.senderId.isNotEmpty &&
+      previous.senderId == current.senderId &&
+      previous.extra['isOwn'] == current.extra['isOwn'] &&
+      previous.status == current.status &&
+      previous.timestamp > 0 &&
+      current.timestamp >= previous.timestamp &&
+      current.timestamp - previous.timestamp <= 180000 &&
+      a.year == b.year &&
+      a.month == b.month &&
+      a.day == b.day;
+}
+
 class MessagesPage extends ConsumerStatefulWidget {
   final VoidCallback onSetup;
   const MessagesPage({super.key, required this.onSetup});
@@ -115,12 +132,21 @@ class MessagesPage extends ConsumerStatefulWidget {
 
 class _MessagesPageState extends ConsumerState<MessagesPage> {
   final compose = TextEditingController(), filter = TextEditingController();
+  final timelineScroll = ScrollController();
+  final messageKeys = <String, GlobalKey>{};
+  bool awayFromLatest = false;
+  bool locatingUnread = false;
+  int newMessageCount = 0;
+  Set<String> knownMessages = {};
+  bool? previousCompact;
   Message? reply;
   bool sending = false, showAgent = false, markdown = false;
+  bool compact = true;
   bool showBlacklisted = false;
   String? attachment, lastConversation;
   @override
   void dispose() {
+    timelineScroll.dispose();
     compose.dispose();
     filter.dispose();
     super.dispose();
@@ -146,6 +172,10 @@ class _MessagesPageState extends ConsumerState<MessagesPage> {
     final c = w.selectedConversation;
     if (lastConversation != c?.key) {
       lastConversation = c?.key;
+      messageKeys.clear();
+      knownMessages = {};
+      newMessageCount = 0;
+      awayFromLatest = false;
       compose.clear();
       reply = null;
       attachment = null;
@@ -163,14 +193,69 @@ class _MessagesPageState extends ConsumerState<MessagesPage> {
             .toList()
           ..sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
     final state = c == null ? null : w.sync[c.key];
+    final timeline = c == null ? <Message>[] : messageTimeline(w, c);
+    final ids = timeline
+        .map((m) => '${m.extra['timelineKey'] ?? m.key}')
+        .toSet();
+    if (awayFromLatest && knownMessages.isNotEmpty) {
+      // History is prepended; only newer additions count as incoming messages.
+      final lastKnown = timeline.lastIndexWhere(
+        (m) => knownMessages.contains('${m.extra['timelineKey'] ?? m.key}'),
+      );
+      if (lastKnown >= 0) newMessageCount += timeline.length - lastKnown - 1;
+    }
+    if (awayFromLatest &&
+        timelineScroll.hasClients &&
+        (previousCompact != compact ||
+            !ids.containsAll(knownMessages) ||
+            !knownMessages.containsAll(ids))) {
+      final viewport = context.findRenderObject() as RenderBox?;
+      if (viewport != null) {
+        final top = viewport.localToGlobal(Offset.zero).dy + 70;
+        final bottom =
+            viewport.localToGlobal(Offset(0, viewport.size.height)).dy - 150;
+        for (final key in messageKeys.values) {
+          final box = key.currentContext?.findRenderObject();
+          if (box is! RenderBox || !box.attached) continue;
+          final y = box.localToGlobal(Offset.zero).dy;
+          if (y < top || y > bottom) continue;
+          final chat = lastConversation;
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (!mounted ||
+                chat != lastConversation ||
+                !timelineScroll.hasClients) {
+              return;
+            }
+            final updated = key.currentContext?.findRenderObject();
+            if (updated is RenderBox && updated.attached) {
+              final delta = updated.localToGlobal(Offset.zero).dy - y;
+              final position = timelineScroll.position;
+              timelineScroll.jumpTo(
+                (position.pixels - delta).clamp(0, position.maxScrollExtent),
+              );
+            }
+          });
+          break;
+        }
+      }
+    }
+    previousCompact = compact;
+    knownMessages = ids;
+    messageKeys.removeWhere((key, _) => !ids.contains(key));
+    final unreadIndex = w.selectedUnreadAfter == null
+        ? -1
+        : timeline.indexWhere(
+            (m) =>
+                m.timestamp > w.selectedUnreadAfter! && senderName(w, m) != '我',
+          );
     return Row(
       children: [
         SizedBox(
-          width: 272,
+          width: 256,
           child: Column(
             children: [
               Padding(
-                padding: const EdgeInsets.all(16),
+                padding: const EdgeInsets.all(10),
                 child: Column(
                   children: [
                     DropdownButtonFormField<String>(
@@ -197,7 +282,7 @@ class _MessagesPageState extends ConsumerState<MessagesPage> {
                         w.changed();
                       },
                     ),
-                    const SizedBox(height: 12),
+                    const SizedBox(height: 8),
                     SizedBox(
                       width: double.infinity,
                       child: SegmentedButton<bool>(
@@ -212,7 +297,7 @@ class _MessagesPageState extends ConsumerState<MessagesPage> {
                         }),
                       ),
                     ),
-                    const SizedBox(height: 12),
+                    const SizedBox(height: 8),
                     TextField(
                       controller: filter,
                       onChanged: (_) => setState(() {}),
@@ -288,6 +373,15 @@ class _MessagesPageState extends ConsumerState<MessagesPage> {
                                 clipBehavior: Clip.antiAlias,
                                 borderRadius: BorderRadius.circular(12),
                                 child: ListTile(
+                                  dense: compact,
+                                  visualDensity: compact
+                                      ? VisualDensity.compact
+                                      : VisualDensity.standard,
+                                  contentPadding: const EdgeInsets.symmetric(
+                                    horizontal: 10,
+                                  ),
+                                  minLeadingWidth: 28,
+                                  horizontalTitleGap: 10,
                                   shape: RoundedRectangleBorder(
                                     borderRadius: BorderRadius.circular(12),
                                   ),
@@ -297,7 +391,7 @@ class _MessagesPageState extends ConsumerState<MessagesPage> {
                                   leading: SenderAvatar(
                                     name: chat.title,
                                     url: chat.avatar,
-                                    radius: 20,
+                                    radius: compact ? 14 : 20,
                                     fallbackIcon: chat.kind == 'group'
                                         ? Icons.group_outlined
                                         : null,
@@ -317,7 +411,7 @@ class _MessagesPageState extends ConsumerState<MessagesPage> {
                                         : chat.watched
                                         ? '已关注'
                                         : timeLabel(chat.updatedAt)}',
-                                    style: const TextStyle(fontSize: 11),
+                                    style: const TextStyle(fontSize: 12),
                                   ),
                                   trailing: chat.unread > 0
                                       ? Tooltip(
@@ -375,8 +469,8 @@ class _MessagesPageState extends ConsumerState<MessagesPage> {
                   children: [
                     Padding(
                       padding: const EdgeInsets.symmetric(
-                        horizontal: 22,
-                        vertical: 14,
+                        horizontal: 14,
+                        vertical: 6,
                       ),
                       child: Row(
                         children: [
@@ -386,6 +480,8 @@ class _MessagesPageState extends ConsumerState<MessagesPage> {
                               children: [
                                 Text(
                                   c.title,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
                                   style: Theme.of(
                                     context,
                                   ).textTheme.titleMedium,
@@ -393,9 +489,21 @@ class _MessagesPageState extends ConsumerState<MessagesPage> {
                                 const SizedBox(height: 4),
                                 Text(
                                   '${w.account(c.accountId).label} · 用户身份 · ${w.isConversationExcluded(c) ? '已排除自动同步' : state?.mode ?? '定时同步'} · ${(state?.lastSuccess ?? 0) == 0 ? '尚未同步' : '最近同步 ${timeLabel(state!.lastSuccess)}'}',
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
                                   style: Theme.of(context).textTheme.bodySmall,
                                 ),
                               ],
+                            ),
+                          ),
+                          IconButton(
+                            tooltip: compact ? '切换舒适布局' : '切换紧凑布局',
+                            onPressed: () => setState(() => compact = !compact),
+                            icon: Icon(
+                              compact
+                                  ? Icons.density_small
+                                  : Icons.density_medium,
+                              size: 18,
                             ),
                           ),
                           if (w.isConversationExcluded(c))
@@ -460,37 +568,93 @@ class _MessagesPageState extends ConsumerState<MessagesPage> {
                     Expanded(
                       child: NotificationListener<ScrollNotification>(
                         onNotification: (notification) {
+                          final away = notification.metrics.pixels > 60;
+                          if (away != awayFromLatest) {
+                            setState(() {
+                              awayFromLatest = away;
+                              if (!away) newMessageCount = 0;
+                            });
+                          }
                           if (notification is ScrollUpdateNotification &&
                               notification.metrics.pixels > 0 &&
                               notification.metrics.extentAfter < 100 &&
-                              !w.loadingEarlier) {
+                              !w.loadingEarlier &&
+                              !locatingUnread) {
                             w.showEarlierMessages();
                           }
                           return false;
                         },
-                        child: ListView(
+                        child: ListView.builder(
                           key: PageStorageKey(c.key),
+                          controller: timelineScroll,
                           reverse: true,
-                          padding: const EdgeInsets.all(22),
-                          children: [
-                            Center(
-                              child: TextButton.icon(
-                                onPressed: () => guarded(
-                                  context,
-                                  () => w.showEarlierMessages(manual: true),
+                          padding: EdgeInsets.all(compact ? 12 : 22),
+                          itemCount: timeline.length + 1,
+                          findChildIndexCallback: (key) {
+                            if (key is! ValueKey<String>) return null;
+                            final index = timeline.indexWhere(
+                              (m) =>
+                                  '${m.extra['timelineKey'] ?? m.key}' ==
+                                  key.value,
+                            );
+                            return index < 0
+                                ? null
+                                : timeline.length - 1 - index;
+                          },
+                          itemBuilder: (context, index) {
+                            if (index == timeline.length) {
+                              return Center(
+                                child: TextButton.icon(
+                                  onPressed: () => guarded(
+                                    context,
+                                    () => w.showEarlierMessages(manual: true),
+                                  ),
+                                  icon: const Icon(Icons.history, size: 16),
+                                  label: Text(
+                                    w.loadingEarlier ? '加载中…' : '加载更早消息',
+                                  ),
                                 ),
-                                icon: const Icon(Icons.history, size: 16),
-                                label: Text(
-                                  w.loadingEarlier ? '加载中…' : '加载更早消息',
-                                ),
+                              );
+                            }
+                            final entry = MapEntry(
+                              timeline.length - 1 - index,
+                              timeline[timeline.length - 1 - index],
+                            );
+
+                            final m = entry.value;
+                            final date = DateTime.fromMillisecondsSinceEpoch(
+                              m.timestamp,
+                            );
+                            final previousDate = entry.key == 0
+                                ? null
+                                : DateTime.fromMillisecondsSinceEpoch(
+                                    timeline[entry.key - 1].timestamp,
+                                  );
+                            final newDay =
+                                previousDate == null ||
+                                date.year != previousDate.year ||
+                                date.month != previousDate.month ||
+                                date.day != previousDate.day;
+                            final grouped =
+                                compact &&
+                                entry.key > 0 &&
+                                entry.key != unreadIndex &&
+                                continuesMessageGroup(
+                                  timeline[entry.key - 1],
+                                  m,
+                                );
+                            return KeyedSubtree(
+                              key: ValueKey<String>(
+                                '${m.extra['timelineKey'] ?? m.key}',
                               ),
-                            ),
-                            ...messageTimeline(w, c).map(
-                              (m) => Padding(
-                                key: ValueKey<String>(
+                              child: Padding(
+                                key: messageKeys.putIfAbsent(
                                   '${m.extra['timelineKey'] ?? m.key}',
+                                  () => GlobalKey(),
                                 ),
-                                padding: const EdgeInsets.only(bottom: 20),
+                                padding: EdgeInsets.only(
+                                  bottom: compact ? (grouped ? 4 : 8) : 20,
+                                ),
                                 // Keep selection out of the recycling timeline.
                                 // Content replacement gets a fresh selection delegate.
                                 child: SelectionArea(
@@ -511,33 +675,74 @@ class _MessagesPageState extends ConsumerState<MessagesPage> {
                                     crossAxisAlignment:
                                         CrossAxisAlignment.start,
                                     children: [
-                                      SelectionContainer.disabled(
-                                        child: SenderAvatar(
-                                          name: senderName(w, m),
-                                          url: senderAvatar(w, m),
-                                          path: senderAvatarPath(w, m),
+                                      if (grouped)
+                                        Tooltip(
+                                          message: messageTimeLabel(
+                                            m.timestamp,
+                                          ),
+                                          child: const SizedBox(
+                                            width: 32,
+                                            height: 24,
+                                            child: Icon(
+                                              Icons.more_horiz,
+                                              size: 12,
+                                            ),
+                                          ),
+                                        )
+                                      else
+                                        SelectionContainer.disabled(
+                                          child: SenderAvatar(
+                                            name: senderName(w, m),
+                                            url: senderAvatar(w, m),
+                                            path: senderAvatarPath(w, m),
+                                          ),
                                         ),
-                                      ),
                                       const SizedBox(width: 10),
                                       Expanded(
                                         child: Column(
                                           crossAxisAlignment:
                                               CrossAxisAlignment.start,
                                           children: [
-                                            Text(
-                                              '${senderName(w, m)}  ·  ${messageTimeLabel(m.timestamp)}',
-                                              style: Theme.of(
-                                                context,
-                                              ).textTheme.labelSmall,
-                                            ),
-                                            const SizedBox(height: 6),
+                                            if (newDay && m.timestamp > 0)
+                                              Padding(
+                                                padding: const EdgeInsets.only(
+                                                  bottom: 6,
+                                                ),
+                                                child: Text(
+                                                  '${date.year}-${date.month.toString().padLeft(2, '0')}-${date.day.toString().padLeft(2, '0')}',
+                                                  style: Theme.of(
+                                                    context,
+                                                  ).textTheme.labelSmall,
+                                                ),
+                                              ),
+                                            if (entry.key == unreadIndex)
+                                              const Text(
+                                                '以下为未读消息',
+                                                style: TextStyle(
+                                                  fontSize: 12,
+                                                  color: Colors.deepOrange,
+                                                ),
+                                              ),
+                                            if (!grouped)
+                                              Text(
+                                                '${senderName(w, m)}  ·  ${messageTimeLabel(m.timestamp)}',
+                                                style: Theme.of(
+                                                  context,
+                                                ).textTheme.labelSmall,
+                                              ),
+                                            SizedBox(height: compact ? 3 : 6),
                                             Container(
-                                              padding: const EdgeInsets.all(14),
+                                              padding: EdgeInsets.symmetric(
+                                                horizontal: compact ? 8 : 14,
+                                                vertical: compact ? 6 : 14,
+                                              ),
                                               decoration: BoxDecoration(
                                                 color:
                                                     scheme.surfaceContainerLow,
                                                 borderRadius:
-                                                    BorderRadius.circular(12),
+                                                    BorderRadius.circular(
+                                                      compact ? 6 : 12,
+                                                    ),
                                               ),
                                               child: Column(
                                                 crossAxisAlignment:
@@ -550,15 +755,33 @@ class _MessagesPageState extends ConsumerState<MessagesPage> {
                                                           const EdgeInsets.only(
                                                             bottom: 8,
                                                           ),
-                                                      child: Text(
-                                                        '回复：${w.messages.where((other) => other.id == m.extra['replyId']).firstOrNull?.text ?? '原消息尚未缓存'}',
-                                                        style: Theme.of(
-                                                          context,
-                                                        ).textTheme.labelSmall,
+                                                      child: Tooltip(
+                                                        message:
+                                                            w.messages
+                                                                .where(
+                                                                  (other) =>
+                                                                      other
+                                                                          .id ==
+                                                                      m.extra['replyId'],
+                                                                )
+                                                                .firstOrNull
+                                                                ?.text ??
+                                                            '原消息尚未缓存',
+                                                        child: Text(
+                                                          '回复：${w.messages.where((other) => other.id == m.extra['replyId']).firstOrNull?.text ?? '原消息尚未缓存'}',
+                                                          maxLines: 2,
+                                                          overflow: TextOverflow
+                                                              .ellipsis,
+                                                          style:
+                                                              Theme.of(context)
+                                                                  .textTheme
+                                                                  .labelSmall,
+                                                        ),
                                                       ),
                                                     ),
                                                   MessageContent(
                                                     m,
+                                                    foldLongText: compact,
                                                     onDownload: () =>
                                                         download(m),
                                                   ),
@@ -630,14 +853,48 @@ class _MessagesPageState extends ConsumerState<MessagesPage> {
                                   ),
                                 ),
                               ),
-                            ),
-                          ].reversed.toList(),
+                            );
+                          },
                         ),
                       ),
                     ),
+                    if (awayFromLatest || unreadIndex >= 0)
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.end,
+                        children: [
+                          if (unreadIndex >= 0)
+                            TextButton(
+                              onPressed: locatingUnread
+                                  ? null
+                                  : () => jumpToUnread(timeline[unreadIndex]),
+                              child: Text(
+                                locatingUnread ? '正在定位…' : '定位未读（已加载）',
+                              ),
+                            ),
+                          if (awayFromLatest)
+                            TextButton.icon(
+                              onPressed: () => timelineScroll.animateTo(
+                                0,
+                                duration: const Duration(milliseconds: 200),
+                                curve: Curves.easeOut,
+                              ),
+                              icon: const Icon(Icons.arrow_downward, size: 16),
+                              label: Text(
+                                newMessageCount > 0
+                                    ? '$newMessageCount 条新消息 · 回到最新'
+                                    : '回到最新',
+                              ),
+                            ),
+                        ],
+                      ),
                     const Divider(),
                     Padding(
-                      padding: const EdgeInsets.fromLTRB(20, 12, 20, 16),
+                      padding: EdgeInsets.fromLTRB(
+                        12,
+                        compact ? 6 : 12,
+                        12,
+                        compact ? 6 : 16,
+                      ),
                       child: Column(
                         children: [
                           if (!w.account(c.accountId).canSend)
@@ -677,14 +934,15 @@ class _MessagesPageState extends ConsumerState<MessagesPage> {
                             ),
                           TextField(
                             controller: compose,
-                            minLines: 2,
+                            minLines: compact ? 1 : 2,
                             maxLines: 5,
                             decoration: const InputDecoration(
                               hintText: '输入消息…',
-                              contentPadding: EdgeInsets.all(16),
+                              isDense: true,
+                              contentPadding: EdgeInsets.all(10),
                             ),
                           ),
-                          const SizedBox(height: 10),
+                          const SizedBox(height: 4),
                           Row(
                             children: [
                               IconButton(
@@ -735,6 +993,40 @@ class _MessagesPageState extends ConsumerState<MessagesPage> {
         ],
       ],
     );
+  }
+
+  Future<void> jumpToUnread(Message message) async {
+    final chat = lastConversation;
+    setState(() => locatingUnread = true);
+    try {
+      // Move through the lazy viewport until the target row is mounted.
+      if (timelineScroll.hasClients) timelineScroll.jumpTo(0);
+      await WidgetsBinding.instance.endOfFrame;
+      while (mounted && lastConversation == chat && timelineScroll.hasClients) {
+        final target =
+            messageKeys['${message.extra['timelineKey'] ?? message.key}']
+                ?.currentContext;
+        if (target != null && target.mounted) {
+          await Scrollable.ensureVisible(
+            target,
+            alignment: .5,
+            duration: const Duration(milliseconds: 200),
+          );
+          break;
+        }
+        final position = timelineScroll.position;
+        if (position.pixels >= position.maxScrollExtent) break;
+        timelineScroll.jumpTo(
+          (position.pixels + position.viewportDimension * .8).clamp(
+            0,
+            position.maxScrollExtent,
+          ),
+        );
+        await WidgetsBinding.instance.endOfFrame;
+      }
+    } finally {
+      if (mounted) setState(() => locatingUnread = false);
+    }
   }
 
   Future<void> conversationMenu(Conversation chat, Offset position) async {

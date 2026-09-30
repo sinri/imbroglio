@@ -65,6 +65,136 @@ void main() {
     await tester.pumpAndSettle();
   }
 
+  test('message groups respect sender, time and date boundaries', () {
+    Message row(String sender, DateTime time) => Message(
+      accountId: 'a',
+      conversationId: 'c',
+      id: '$sender:$time',
+      text: '内容',
+      senderId: sender,
+      timestamp: time.millisecondsSinceEpoch,
+    );
+    final start = DateTime(2026, 9, 30, 12);
+    expect(
+      continuesMessageGroup(
+        row('u', start),
+        row('u', start.add(const Duration(minutes: 2))),
+      ),
+      isTrue,
+    );
+    expect(continuesMessageGroup(row('u', start), row('v', start)), isFalse);
+    expect(
+      continuesMessageGroup(
+        row('u', start),
+        row('u', start.add(const Duration(minutes: 4))),
+      ),
+      isFalse,
+    );
+    expect(continuesMessageGroup(row('', start), row('', start)), isFalse);
+    expect(
+      continuesMessageGroup(
+        row('u', DateTime(2026, 9, 30, 23, 59)),
+        row('u', DateTime(2026, 10, 1)),
+      ),
+      isFalse,
+    );
+  });
+
+  testWidgets('opening an unread chat retains the local reading boundary', (
+    tester,
+  ) async {
+    await w.markRead(chat);
+    final timestamp = DateTime.now().millisecondsSinceEpoch + 1000;
+    await w.store.saveMessage(
+      Message(
+        accountId: 'a',
+        conversationId: 'c',
+        id: 'unread',
+        senderId: 'other',
+        text: '未读内容',
+        timestamp: timestamp,
+      ),
+    );
+    w.conversations = [chat.copyWith(unread: 1)];
+    await open(tester);
+    expect(w.selectedConversation!.unread, 0);
+    expect(w.selectedUnreadAfter, lessThan(timestamp));
+    expect(find.text('以下为未读消息'), findsOneWidget);
+    await tester.tap(find.text('定位未读（已加载）'));
+    await tester.pumpAndSettle();
+    expect(find.text('未读内容').hitTestable(), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('incoming messages preserve historical reading position', (
+    tester,
+  ) async {
+    for (var i = 0; i < 30; i++) {
+      await w.store.saveMessage(
+        Message(
+          accountId: 'a',
+          conversationId: 'c',
+          id: 'scroll$i',
+          text: '历史消息 $i',
+          timestamp: i + 1,
+        ),
+      );
+    }
+    await open(tester);
+    await tester.drag(find.byType(ListView).last, const Offset(0, 300));
+    await tester.pumpAndSettle();
+    expect(find.text('回到最新'), findsOneWidget);
+    final visible = find
+        .textContaining('历史消息 ')
+        .evaluate()
+        .where((element) {
+          final y = tester.getTopLeft(find.byWidget(element.widget)).dy;
+          return y > 120 && y < 420;
+        })
+        .first
+        .widget;
+    final before = tester.getTopLeft(find.byWidget(visible)).dy;
+    w.messages = [
+      ...w.messages,
+      const Message(
+        accountId: 'a',
+        conversationId: 'c',
+        id: 'new',
+        text: '新到的消息',
+        timestamp: 100,
+      ),
+    ];
+    w.changed();
+    await tester.pumpAndSettle();
+    final label = (visible as Text).data!;
+    expect(tester.getTopLeft(find.text(label)).dy, closeTo(before, 2));
+    expect(find.text('1 条新消息 · 回到最新'), findsOneWidget);
+    await tester.tap(find.text('1 条新消息 · 回到最新'));
+    await tester.pumpAndSettle();
+    expect(find.text('新到的消息'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('density switch expands composer without losing its draft', (
+    tester,
+  ) async {
+    await open(tester);
+    final composer = find.byWidgetPredicate(
+      (widget) => widget is TextField && widget.decoration?.hintText == '输入消息…',
+    );
+    await tester.enterText(composer, '保留草稿');
+    final compactHeight = tester.getSize(composer).height;
+    await tester.tap(find.byTooltip('切换舒适布局'));
+    await tester.pumpAndSettle();
+    expect(tester.getSize(composer).height, greaterThan(compactHeight));
+    expect(find.text('保留草稿'), findsOneWidget);
+    await tester.tap(find.byTooltip('切换紧凑布局'));
+    await tester.pumpAndSettle();
+    expect(tester.getSize(composer).height, compactHeight);
+    expect(find.text('保留草稿'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
   testWidgets(
     'scrolling selected conversation does not paint over the header',
     (tester) async {
@@ -519,6 +649,9 @@ void main() {
       );
       await open(tester);
       final body = find.byType(MessageContent);
+      expect(tester.getSize(body).height, lessThan(400));
+      await tester.tap(find.text('展开完整消息'));
+      await tester.pumpAndSettle();
       expect(tester.getSize(body).height, greaterThan(740));
       expect(
         find.descendant(of: body, matching: find.byType(Scrollable)),

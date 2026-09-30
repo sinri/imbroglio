@@ -28,6 +28,24 @@ class ImbroglioApp extends ConsumerWidget {
       colorScheme: scheme,
       brightness: brightness,
       scaffoldBackgroundColor: scheme.surface,
+      visualDensity: VisualDensity.compact,
+      textTheme: const TextTheme(
+        bodyLarge: TextStyle(fontSize: 14, height: 1.43),
+        bodyMedium: TextStyle(fontSize: 14, height: 1.43),
+        bodySmall: TextStyle(fontSize: 12, height: 1.33),
+        titleMedium: TextStyle(
+          fontSize: 15,
+          height: 1.33,
+          fontWeight: FontWeight.w600,
+        ),
+        labelSmall: TextStyle(fontSize: 12, height: 1.33),
+      ),
+      iconButtonTheme: IconButtonThemeData(
+        style: IconButton.styleFrom(
+          minimumSize: const Size(32, 32),
+          padding: const EdgeInsets.all(6),
+        ),
+      ),
       inputDecorationTheme: InputDecorationTheme(
         filled: true,
         fillColor: scheme.surfaceContainerLow,
@@ -145,26 +163,27 @@ class _WorkspaceShellState extends ConsumerState<WorkspaceShell> {
       body: Row(
         children: [
           Container(
-            width: 88,
+            width: 56,
             color: color.surfaceContainerLow,
             child: Column(
               children: [
-                const SizedBox(height: 30),
+                const SizedBox(height: 12),
                 ClipRRect(
                   borderRadius: BorderRadius.circular(10),
                   child: Image.asset(
                     'assets/branding/logo.png',
-                    width: 64,
-                    height: 64,
+                    width: 28,
+                    height: 28,
                     semanticLabel: 'Imbroglio',
                   ),
                 ),
-                const SizedBox(height: 30),
+                const SizedBox(height: 12),
                 Expanded(
                   child: NavigationRail(
                     backgroundColor: Colors.transparent,
                     selectedIndex: page,
-                    labelType: NavigationRailLabelType.all,
+                    minWidth: 56,
+                    labelType: NavigationRailLabelType.none,
                     onDestinationSelected: (i) {
                       setState(() => page = i);
                       w.updateReading(visible: i == 0);
@@ -214,49 +233,56 @@ class _WorkspaceShellState extends ConsumerState<WorkspaceShell> {
           Expanded(
             child: Column(
               children: [
-                Container(
-                  height: 64,
-                  padding: const EdgeInsets.symmetric(horizontal: 24),
-                  child: Row(
-                    children: [
-                      Text(
-                        ['消息工作台', '资料与知识', 'Agent 工作台', '插件中心', '偏好与账号'][page],
-                        style: Theme.of(context).textTheme.titleMedium,
-                      ),
-                      const Spacer(),
-                      Container(
-                        width: 7,
-                        height: 7,
-                        decoration: BoxDecoration(
-                          color:
-                              !w.waitingForNetwork &&
-                                  w.accounts.any((a) => a.enabled)
-                              ? Colors.teal
-                              : color.outline,
-                          shape: BoxShape.circle,
+                if (page != 0)
+                  Container(
+                    height: 48,
+                    padding: const EdgeInsets.symmetric(horizontal: 24),
+                    child: Row(
+                      children: [
+                        Text(
+                          [
+                            '消息工作台',
+                            '资料与知识',
+                            'Agent 工作台',
+                            '插件中心',
+                            '偏好与账号',
+                          ][page],
+                          style: Theme.of(context).textTheme.titleMedium,
                         ),
-                      ),
-                      const SizedBox(width: 8),
-                      Text(
-                        w.offline
-                            ? '脱机模式'
-                            : w.waitingForNetwork
-                            ? '等待网络恢复'
-                            : '${w.accounts.where((a) => a.enabled).length} 个账号已连接',
-                        style: Theme.of(context).textTheme.bodySmall,
-                      ),
-                      const SizedBox(width: 20),
-                      const Text(
-                        'IMBROGLIO',
-                        style: TextStyle(
-                          letterSpacing: 2,
-                          fontSize: 11,
-                          fontWeight: FontWeight.w700,
+                        const Spacer(),
+                        Container(
+                          width: 7,
+                          height: 7,
+                          decoration: BoxDecoration(
+                            color:
+                                !w.waitingForNetwork &&
+                                    w.accounts.any((a) => a.enabled)
+                                ? Colors.teal
+                                : color.outline,
+                            shape: BoxShape.circle,
+                          ),
                         ),
-                      ),
-                    ],
+                        const SizedBox(width: 8),
+                        Text(
+                          w.offline
+                              ? '脱机模式'
+                              : w.waitingForNetwork
+                              ? '等待网络恢复'
+                              : '${w.accounts.where((a) => a.enabled).length} 个账号已连接',
+                          style: Theme.of(context).textTheme.bodySmall,
+                        ),
+                        const SizedBox(width: 20),
+                        const Text(
+                          'IMBROGLIO',
+                          style: TextStyle(
+                            letterSpacing: 2,
+                            fontSize: 11,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                      ],
+                    ),
                   ),
-                ),
                 const Divider(),
                 if (w.waitingForNetwork)
                   Material(

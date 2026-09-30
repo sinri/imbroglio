@@ -31,7 +31,7 @@ class BackgroundActivityBar extends ConsumerWidget {
           builder: (_) => const BackgroundActivityDialog(),
         ),
         child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 0),
           child: Row(
             children: [
               if (current != null)
@@ -46,8 +46,12 @@ class BackgroundActivityBar extends ConsumerWidget {
                   size: 17,
                 ),
               const SizedBox(width: 10),
-              const Text(
-                '后台活动',
+              Text(
+                w.offline
+                    ? '脱机模式'
+                    : w.waitingForNetwork
+                    ? '等待网络'
+                    : '${w.accounts.where((a) => a.enabled).length} 个账号 · 后台活动',
                 style: TextStyle(fontWeight: FontWeight.w600, fontSize: 12),
               ),
               const SizedBox(width: 12),
