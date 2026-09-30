@@ -1,0 +1,10 @@
+{
+  "id": "example.local-helper",
+  "name": "本地文本助手",
+  "version": "1.0.0",
+  "kind": "agent",
+  "protocol": 1,
+  "prompt": "帮助用户分析文本。需要准确统计时使用文本统计 skill。",
+  "tools": [],
+  "skills": ["example.text-stats"]
+}

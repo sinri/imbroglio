@@ -1,0 +1,17 @@
+{
+  "id": "example.text-stats",
+  "name": "文本统计",
+  "version": "1.0.0",
+  "kind": "skill",
+  "protocol": 1,
+  "tools": [],
+  "scripts": [
+    {
+      "id": "count",
+      "description": "统计文本字符数与行数，输入 JSON：{\"text\":\"待统计文本\"}",
+      "path": "scripts/count.py",
+      "interpreter": "python3",
+      "timeoutSeconds": 30
+    }
+  ]
+}

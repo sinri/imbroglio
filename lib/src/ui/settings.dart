@@ -11,8 +11,11 @@ import '../core/models.dart';
 import '../core/feishu_auth.dart';
 import '../services/agent.dart';
 import '../services/agent_limits.dart';
+import '../services/agent_extensions.dart';
 import 'app.dart';
 import 'conversation_blacklist.dart';
+import 'mcp_servers.dart';
+import 'agent_editor.dart';
 
 class PluginsPage extends ConsumerStatefulWidget {
   const PluginsPage({super.key});
@@ -26,170 +29,271 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
   @override
   Widget build(BuildContext context) {
     final w = ref.watch(workspaceProvider);
-    return ListView(
-      padding: const EdgeInsets.all(28),
-      children: [
-        Row(
+    final agents = w.packages.where((p) => p['kind'] == 'agent').toList();
+    final skills = w.packages.where((p) => p['kind'] == 'skill').toList();
+    final connectors = w.packages.where((p) => p['kind'] == 'im').toList();
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final compact = constraints.maxWidth < 700;
+        return ListView(
+          padding: EdgeInsets.all(compact ? 16 : 32),
           children: [
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    '你的工作能力，由插件扩展',
-                    style: Theme.of(context).textTheme.headlineSmall,
-                  ),
-                  const SizedBox(height: 8),
-                  const Text('官方 CLI 独立安装与更新，无需系统预装 Node 或 Go。'),
-                ],
+            Center(
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 1100),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Text(
+                      '插件中心',
+                      style: Theme.of(context).textTheme.headlineMedium,
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      '连接工作平台，组合你的 Agent 与技能。',
+                      style: Theme.of(context).textTheme.bodyLarge?.copyWith(
+                        color: Theme.of(context).colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                    const SizedBox(height: 20),
+                    Wrap(
+                      spacing: 12,
+                      runSpacing: 10,
+                      children: [
+                        FilledButton.icon(
+                          onPressed: () => editDefinition('agent'),
+                          icon: const Icon(Icons.add),
+                          label: const Text('新建 Agent'),
+                        ),
+                        FilledButton.tonalIcon(
+                          onPressed: () => editDefinition('skill'),
+                          icon: const Icon(Icons.add),
+                          label: const Text('新建 Skill'),
+                        ),
+                        OutlinedButton.icon(
+                          onPressed: importDirectory,
+                          icon: const Icon(Icons.create_new_folder_outlined),
+                          label: const Text('导入 Agent / skill 目录'),
+                        ),
+                        OutlinedButton.icon(
+                          onPressed: importPackage,
+                          icon: const Icon(Icons.upload_file_outlined),
+                          label: const Text('安装插件包'),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 32),
+                    _sectionTitle(
+                      '平台连接器',
+                      '安装后，在「设置 → 账号与授权」连接账号。',
+                      Icons.hub_outlined,
+                      2 + connectors.length,
+                    ),
+                    LayoutBuilder(
+                      builder: (context, box) {
+                        final width = box.maxWidth >= 760
+                            ? (box.maxWidth - 16) / 2
+                            : box.maxWidth;
+                        return Wrap(
+                          spacing: 16,
+                          runSpacing: 12,
+                          children: [
+                            for (final id in ['dingtalk', 'feishu'])
+                              SizedBox(width: width, child: _officialCard(id)),
+                          ],
+                        );
+                      },
+                    ),
+                    for (final plugin in connectors) _packageCard(plugin),
+                    const SizedBox(height: 28),
+                    _sectionTitle(
+                      'Agent',
+                      '选择一个助手发起对话；可组合多个技能完成工作。',
+                      Icons.auto_awesome_outlined,
+                      agents.length,
+                    ),
+                    if (agents.isEmpty)
+                      _empty('尚未创建 Agent', '直接新建助手，或从已有目录导入。'),
+                    for (final plugin in agents) _packageCard(plugin),
+                    const SizedBox(height: 28),
+                    _sectionTitle(
+                      'Skills · 技能',
+                      '独立管理、供 Agent 引用；同一个技能可以被多个助手共用。',
+                      Icons.extension_outlined,
+                      skills.length,
+                    ),
+                    if (skills.isEmpty) _empty('尚未创建技能', '直接新建可复用的技能，或从目录导入。'),
+                    for (final plugin in skills) _packageCard(plugin),
+                    const SizedBox(height: 28),
+                    const McpServersSection(),
+                    const SizedBox(height: 28),
+                    _sectionTitle(
+                      '运行权限',
+                      '此设置对当前工作区的所有 Agent 与技能生效。',
+                      Icons.admin_panel_settings_outlined,
+                      null,
+                    ),
+                    Card(
+                      margin: EdgeInsets.zero,
+                      child: FutureBuilder<bool>(
+                        future: AgentExtensions(w.root, w.store).scriptsEnabled,
+                        builder: (context, snapshot) => SwitchListTile(
+                          contentPadding: const EdgeInsets.symmetric(
+                            horizontal: 20,
+                            vertical: 12,
+                          ),
+                          title: const Text('允许本地脚本执行'),
+                          subtitle: const Padding(
+                            padding: EdgeInsets.only(top: 8),
+                            child: Text(
+                              '默认关闭，开启后每次执行仍需确认。脚本可访问本机文件和网络，请仅使用可信定义。',
+                            ),
+                          ),
+                          value: snapshot.data ?? false,
+                          onChanged: snapshot.hasData
+                              ? (value) => guarded(context, () async {
+                                  await AgentExtensions(
+                                    w.root,
+                                    w.store,
+                                  ).setScriptsEnabled(value);
+                                  if (!value) {
+                                    ref.read(agentProvider).cancelLocalScript();
+                                  }
+                                  w.changed();
+                                })
+                              : null,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
               ),
             ),
-            OutlinedButton.icon(
-              onPressed: importPackage,
-              icon: const Icon(Icons.upload_file),
-              label: const Text('安装插件包'),
-            ),
           ],
+        );
+      },
+    );
+  }
+
+  Widget _sectionTitle(
+    String title,
+    String description,
+    IconData icon,
+    int? count,
+  ) {
+    final theme = Theme.of(context);
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(icon, size: 20, color: theme.colorScheme.primary),
+              const SizedBox(width: 10),
+              Text(title, style: theme.textTheme.titleLarge),
+              if (count != null) ...[
+                const SizedBox(width: 10),
+                _badge('$count'),
+              ],
+            ],
+          ),
+          const SizedBox(height: 6),
+          Text(
+            description,
+            style: theme.textTheme.bodyMedium?.copyWith(
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _badge(String label) => Container(
+    padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
+    decoration: BoxDecoration(
+      color: Theme.of(context).colorScheme.surfaceContainerHighest,
+      borderRadius: BorderRadius.circular(6),
+    ),
+    child: Text(label, style: Theme.of(context).textTheme.labelSmall),
+  );
+
+  Widget _empty(String title, String description) => Container(
+    width: double.infinity,
+    padding: const EdgeInsets.all(24),
+    decoration: BoxDecoration(
+      border: Border.all(color: Theme.of(context).colorScheme.outlineVariant),
+      borderRadius: BorderRadius.circular(12),
+    ),
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(title, style: Theme.of(context).textTheme.titleSmall),
+        const SizedBox(height: 6),
+        Text(
+          description,
+          style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+            color: Theme.of(context).colorScheme.onSurfaceVariant,
+          ),
         ),
-        const SizedBox(height: 28),
-        ...['dingtalk', 'feishu'].map(
-          (id) => FutureBuilder<Json?>(
-            future: w.plugins.installation(id),
-            builder: (context, snapshot) {
-              final install = snapshot.data;
-              return Card(
-                margin: const EdgeInsets.only(bottom: 16),
-                child: Padding(
-                  padding: const EdgeInsets.all(24),
+      ],
+    ),
+  );
+
+  Widget _packageCard(Json plugin) {
+    final w = ref.read(workspaceProvider);
+    final tools = (plugin['tools'] as List? ?? []);
+    final skills = (plugin['skills'] as List? ?? []);
+    final scripts = (plugin['scripts'] as List? ?? []);
+    final enabled = plugin['enabled'] == true;
+    return Card(
+      margin: const EdgeInsets.only(bottom: 10),
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Expanded(
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Row(
+                      Text(
+                        '${plugin['name']}',
+                        style: Theme.of(context).textTheme.titleMedium,
+                      ),
+                      const SizedBox(height: 8),
+                      Wrap(
+                        spacing: 6,
+                        runSpacing: 6,
                         children: [
-                          CircleAvatar(
-                            radius: 25,
-                            backgroundColor: id == 'dingtalk'
-                                ? const Color(0xffe0edff)
-                                : const Color(0xffdcf4ef),
-                            child: Icon(
-                              id == 'dingtalk' ? Icons.bolt : Icons.flight,
-                              color: id == 'dingtalk'
-                                  ? Colors.blue
-                                  : Colors.teal,
-                            ),
+                          _badge(
+                            plugin['builtin'] == true
+                                ? '内置'
+                                : plugin['origin'] == 'editor'
+                                ? '本地创建 / 编辑'
+                                : '已导入',
                           ),
-                          const SizedBox(width: 16),
-                          Expanded(
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Text(
-                                  id == 'dingtalk'
-                                      ? '钉钉 · DingTalk Workspace'
-                                      : '飞书 · Lark CLI',
-                                  style: Theme.of(
-                                    context,
-                                  ).textTheme.titleMedium,
-                                ),
-                                const SizedBox(height: 5),
-                                Text(
-                                  install == null
-                                      ? '尚未安装'
-                                      : '${install['version']} · ${install['enabled'] == true ? '已启用' : '已停用'}',
-                                ),
-                              ],
-                            ),
-                          ),
-                          FilledButton(
-                            onPressed: busy.contains(id)
-                                ? null
-                                : () => installCli(id),
-                            child: Text(install == null ? '安装' : '检查更新'),
-                          ),
-                          if (install != null)
-                            PopupMenuButton<String>(
-                              onSelected: (value) => guarded(context, () async {
-                                if (value != 'rollback') {
-                                  await w.stopPlatform(id);
-                                }
-                                if (value == 'rollback') {
-                                  await w.rollbackPlugin(id);
-                                } else if (value == 'toggle') {
-                                  await w.plugins.setEnabled(
-                                    id,
-                                    install['enabled'] != true,
-                                  );
-                                } else if (value == 'uninstall') {
-                                  await w.plugins.uninstall(id);
-                                }
-                                w.changed();
-                                setState(() {});
-                              }),
-                              itemBuilder: (_) => [
-                                PopupMenuItem(
-                                  value: 'toggle',
-                                  child: Text(
-                                    install['enabled'] == true ? '停用' : '启用',
-                                  ),
-                                ),
-                                if (install['previous'] != null)
-                                  const PopupMenuItem(
-                                    value: 'rollback',
-                                    child: Text('回滚上一版'),
-                                  ),
-                                const PopupMenuItem(
-                                  value: 'uninstall',
-                                  child: Text('卸载（保留账号数据）'),
-                                ),
-                              ],
-                            ),
+                          _badge('${plugin['version']}'),
+                          if (tools.isNotEmpty) _badge('${tools.length} 个工具'),
+                          if (skills.isNotEmpty) _badge('${skills.length} 个技能'),
+                          if (scripts.isNotEmpty)
+                            _badge('${scripts.length} 个脚本'),
                         ],
                       ),
-                      const SizedBox(height: 16),
-                      Text(
-                        id == 'dingtalk'
-                            ? '消息轮询 · 会话收发 · 文档和待办'
-                            : '用户身份沟通 · 个人会话定时同步 · 文档和待办',
-                      ),
-                      if (progress[id] != null) ...[
-                        const SizedBox(height: 12),
-                        Text(
-                          progress[id]!,
-                          style: Theme.of(context).textTheme.labelSmall,
-                        ),
-                      ],
-                      if (busy.contains(id))
-                        const Padding(
-                          padding: EdgeInsets.only(top: 12),
-                          child: LinearProgressIndicator(),
-                        ),
                     ],
                   ),
                 ),
-              );
-            },
-          ),
-        ),
-        const SizedBox(height: 18),
-        Text('Agent 与扩展插件', style: Theme.of(context).textTheme.titleLarge),
-        const SizedBox(height: 12),
-        ...w.packages.map(
-          (plugin) => Card(
-            child: ListTile(
-              contentPadding: const EdgeInsets.all(16),
-              leading: Icon(
-                plugin['kind'] == 'agent'
-                    ? Icons.auto_awesome_outlined
-                    : Icons.extension_outlined,
-              ),
-              title: Text('${plugin['name']}'),
-              subtitle: Text(
-                '${plugin['version']} · ${(plugin['tools'] as List? ?? []).join(' / ')}',
-              ),
-              trailing: Wrap(
-                children: [
-                  Switch(
-                    value: plugin['enabled'] == true,
+                const SizedBox(width: 8),
+                Tooltip(
+                  message: enabled
+                      ? '停用 ${plugin['name']}'
+                      : '启用 ${plugin['name']}',
+                  child: Switch(
+                    value: enabled,
                     onChanged: (value) => guarded(context, () async {
                       if (!value && plugin['kind'] == 'im') {
                         await w.stopPlatform(plugin['id']);
@@ -202,30 +306,236 @@ class _PluginsPageState extends ConsumerState<PluginsPage> {
                       w.changed();
                     }),
                   ),
-                  if (plugin['builtin'] != true)
-                    IconButton(
-                      tooltip: '卸载',
-                      onPressed: () => guarded(context, () async {
-                        if (plugin['kind'] == 'im') {
-                          await w.stopPlatform(plugin['id']);
-                        }
-                        await w.plugins.uninstall(plugin['id'], package: true);
-                        w.packages = await w.store.list('packages');
-                        w.changed();
-                      }),
-                      icon: const Icon(Icons.delete_outline),
-                    ),
+                ),
+                if (plugin['builtin'] != true ||
+                    ['agent', 'skill'].contains(plugin['kind']))
+                  PopupMenuButton<String>(
+                    tooltip: '更多操作',
+                    onSelected: (action) => guarded(context, () async {
+                      if (action == 'edit') {
+                        await editDefinition(plugin['kind'], plugin);
+                        return;
+                      }
+                      if (plugin['kind'] == 'im') {
+                        await w.stopPlatform(plugin['id']);
+                      }
+                      await w.plugins.uninstall(plugin['id'], package: true);
+                      w.packages = await w.store.list('packages');
+                      w.changed();
+                    }),
+                    itemBuilder: (_) => [
+                      if (['agent', 'skill'].contains(plugin['kind']))
+                        const PopupMenuItem(value: 'edit', child: Text('编辑定义')),
+                      if (plugin['builtin'] != true)
+                        const PopupMenuItem(
+                          value: 'uninstall',
+                          child: Text('卸载'),
+                        ),
+                    ],
+                  ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Text(
+              enabled ? '已启用' : '已停用',
+              style: Theme.of(context).textTheme.labelMedium?.copyWith(
+                color: enabled
+                    ? Theme.of(context).colorScheme.primary
+                    : Theme.of(context).colorScheme.onSurfaceVariant,
+              ),
+            ),
+            Theme(
+              data: Theme.of(
+                context,
+              ).copyWith(dividerColor: Colors.transparent),
+              child: ExpansionTile(
+                key: ValueKey('plugin-details-${plugin['id']}'),
+                tilePadding: EdgeInsets.zero,
+                childrenPadding: const EdgeInsets.only(bottom: 8),
+                dense: true,
+                title: const Text('查看详情'),
+                expandedCrossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Align(
+                    alignment: Alignment.centerLeft,
+                    child: SelectableText('ID：${plugin['id']}'),
+                  ),
+                  if (tools.isNotEmpty) Text('工具：${tools.join('、')}'),
+                  if (skills.isNotEmpty) Text('引用技能：${skills.join('、')}'),
+                  if (scripts.isNotEmpty)
+                    Text('脚本：${scripts.map((s) => s['id']).join('、')}'),
                 ],
               ),
             ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> editDefinition(String kind, [Json? existing]) =>
+      guarded(context, () async {
+        final w = ref.read(workspaceProvider);
+        final extensions = AgentExtensions(w.root, w.store);
+        final original = existing == null
+            ? null
+            : await w.store.get('packages', existing['id']);
+        if (existing != null && original == null) {
+          throw const AppFailure('plugin', '定义已被删除，请刷新后重试');
+        }
+        final sources = original == null
+            ? <String, String>{}
+            : await extensions.scriptSources(original);
+        final skills = (await w.store.list(
+          'packages',
+        )).where((d) => d['kind'] == 'skill').toList();
+        final servers = await w.store.list('mcpServers');
+        if (!mounted) return;
+        final saved = await showDialog<bool>(
+          context: context,
+          barrierDismissible: false,
+          builder: (_) => AgentDefinitionEditor(
+            extensions: extensions,
+            kind: kind,
+            original: original,
+            skills: skills,
+            servers: servers,
+            sources: sources,
           ),
-        ),
-        const SizedBox(height: 20),
-        const Text(
-          '安装完成后，请前往「设置 → 账号与授权」连接和管理账号。',
-          style: TextStyle(fontSize: 12),
-        ),
-      ],
+        );
+        if (saved == true) {
+          w.packages = await w.store.list('packages');
+          w.changed();
+        }
+      });
+
+  Future<void> importDirectory() => guarded(context, () async {
+    final directory = await FilePicker.getDirectoryPath();
+    if (directory == null) return;
+    final w = ref.read(workspaceProvider);
+    await AgentExtensions(w.root, w.store).importDirectory(directory);
+    w.packages = await w.store.list('packages');
+    w.changed();
+  });
+
+  Widget _officialCard(String id) {
+    final w = ref.read(workspaceProvider);
+    return FutureBuilder<Json?>(
+      future: w.plugins.installation(id),
+      builder: (context, snapshot) {
+        final install = snapshot.data;
+        return Card(
+          margin: const EdgeInsets.only(bottom: 16),
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    CircleAvatar(
+                      radius: 25,
+                      backgroundColor: id == 'dingtalk'
+                          ? const Color(0xffe0edff)
+                          : const Color(0xffdcf4ef),
+                      child: Icon(
+                        id == 'dingtalk' ? Icons.bolt : Icons.flight,
+                        color: id == 'dingtalk' ? Colors.blue : Colors.teal,
+                      ),
+                    ),
+                    const SizedBox(width: 16),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            id == 'dingtalk'
+                                ? '钉钉 · DingTalk Workspace'
+                                : '飞书 · Lark CLI',
+                            style: Theme.of(context).textTheme.titleMedium,
+                          ),
+                          const SizedBox(height: 5),
+                          Text(
+                            install == null
+                                ? '尚未安装'
+                                : '${install['version']} · ${install['enabled'] == true ? '已启用' : '已停用'}',
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 16),
+                Text(
+                  id == 'dingtalk'
+                      ? '消息轮询 · 会话收发 · 文档和待办'
+                      : '用户身份沟通 · 个人会话定时同步 · 文档和待办',
+                ),
+                const SizedBox(height: 16),
+                Row(
+                  children: [
+                    FilledButton(
+                      onPressed: busy.contains(id)
+                          ? null
+                          : () => installCli(id),
+                      child: Text(install == null ? '安装' : '检查更新'),
+                    ),
+                    if (install != null)
+                      PopupMenuButton<String>(
+                        onSelected: (value) => guarded(context, () async {
+                          if (value != 'rollback') {
+                            await w.stopPlatform(id);
+                          }
+                          if (value == 'rollback') {
+                            await w.rollbackPlugin(id);
+                          } else if (value == 'toggle') {
+                            await w.plugins.setEnabled(
+                              id,
+                              install['enabled'] != true,
+                            );
+                          } else if (value == 'uninstall') {
+                            await w.plugins.uninstall(id);
+                          }
+                          w.changed();
+                          setState(() {});
+                        }),
+                        itemBuilder: (_) => [
+                          PopupMenuItem(
+                            value: 'toggle',
+                            child: Text(
+                              install['enabled'] == true ? '停用' : '启用',
+                            ),
+                          ),
+                          if (install['previous'] != null)
+                            const PopupMenuItem(
+                              value: 'rollback',
+                              child: Text('回滚上一版'),
+                            ),
+                          const PopupMenuItem(
+                            value: 'uninstall',
+                            child: Text('卸载（保留账号数据）'),
+                          ),
+                        ],
+                      ),
+                  ],
+                ),
+                if (progress[id] != null) ...[
+                  const SizedBox(height: 12),
+                  Text(
+                    progress[id]!,
+                    style: Theme.of(context).textTheme.labelSmall,
+                  ),
+                ],
+                if (busy.contains(id))
+                  const Padding(
+                    padding: EdgeInsets.only(top: 12),
+                    child: LinearProgressIndicator(),
+                  ),
+              ],
+            ),
+          ),
+        );
+      },
     );
   }
 

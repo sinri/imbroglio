@@ -264,11 +264,52 @@ class PluginManifest {
       data = j {
     if (!RegExp(r'^[a-z][a-z0-9_.-]{1,63}$').hasMatch(id) ||
         protocol != 1 ||
-        !['im', 'agent'].contains(kind)) {
+        !['im', 'agent', 'skill'].contains(kind)) {
       throw const FormatException('插件 ID、种类或协议不兼容');
     }
-    if (kind == 'agent' && (j['prompt'] is! String || j['tools'] is! List)) {
+    if (['agent', 'skill'].contains(kind) &&
+        (j['prompt'] is! String || j['tools'] is! List)) {
       throw const FormatException('Agent 插件缺少 prompt/tools');
+    }
+    if (['agent', 'skill'].contains(kind)) {
+      if ((j['tools'] as List).any((v) => v is! String) ||
+          (j['skills'] != null &&
+              (j['skills'] is! List ||
+                  (j['skills'] as List).any((v) => v is! String))) ||
+          (kind == 'skill' && (j['skills'] as List? ?? []).isNotEmpty) ||
+          (j['scripts'] != null && j['scripts'] is! List)) {
+        throw const FormatException('无效的 tools/skills/scripts 定义');
+      }
+      if (j['mcpServers'] != null &&
+          (j['mcpServers'] is! List ||
+              (j['mcpServers'] as List).any((id) => id is! String))) {
+        throw const FormatException('mcpServers 必须为服务器 ID 数组');
+      }
+      final names = <String>{};
+      for (final raw in j['scripts'] as List? ?? []) {
+        final script = object(raw);
+        final id = script['id'];
+        final path = script['path'];
+        final timeout = script['timeoutSeconds'] ?? 60;
+        if (id is! String ||
+            !RegExp(r'^[a-z][a-z0-9_-]{0,63}$').hasMatch(id) ||
+            !names.add(id) ||
+            path is! String ||
+            path.isEmpty ||
+            path.startsWith('/') ||
+            path.contains('\\') ||
+            path.contains(':') ||
+            path.split('/').contains('..') ||
+            script['interpreter'] is! String ||
+            (script['interpreter'] as String).trim().isEmpty ||
+            timeout is! int ||
+            timeout < 1 ||
+            timeout > 300) {
+          throw const FormatException(
+            '无效脚本定义：需要唯一 id、相对 path、interpreter 与 1–300 秒超时',
+          );
+        }
+      }
     }
   }
 }

@@ -9,6 +9,10 @@ class MainFlutterWindow: NSWindow {
     let startupBegan = ProcessInfo.processInfo.systemUptime
     let flutterViewController = FlutterViewController()
     self.contentViewController = flutterViewController
+    // The nib's original content view is replaced above. Route keyboard input
+    // to Flutter instead of leaving the window as the first responder.
+    initialFirstResponder = flutterViewController.view
+    makeFirstResponder(flutterViewController.view)
 
     // Show useful native content even before Dart or the debugger is ready.
     if let screen = NSScreen.screens.first(where: { $0.frame.contains(NSEvent.mouseLocation) }) ?? NSScreen.main {
@@ -50,6 +54,9 @@ class MainFlutterWindow: NSWindow {
       }
       self?.loadingView?.removeFromSuperview()
       self?.loadingView = nil
+      if let window = self {
+        window.makeFirstResponder(window.contentViewController?.view)
+      }
       self?.makeKeyAndOrderFront(nil)
       NSApp.activate(ignoringOtherApps: true)
       result(Int((ProcessInfo.processInfo.systemUptime - startupBegan) * 1_000_000))

@@ -315,6 +315,8 @@ String operationSummary(Json preview, Workspace workspace) {
   final args = object(preview['arguments']);
   final name =
       {
+        'mcp_call': '调用 MCP 工具',
+        'run_script': '执行本地脚本',
         'send_message': '发送消息',
         'create_document': '创建文档',
         'create_task': '创建待办',
@@ -330,6 +332,12 @@ String operationSummary(Json preview, Workspace workspace) {
     lines.add('会话：${chat?.title ?? args['conversation']}');
   }
   for (final field in {
+    'server': 'MCP 服务器',
+    'mcpTool': '工具',
+    'script': '脚本',
+    'interpreter': '解释器',
+    'path': '文件',
+    'input': '输入 JSON',
     'title': '标题',
     'assignee': '执行者',
     'due': '截止时间',
