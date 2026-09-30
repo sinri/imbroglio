@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:crypto/crypto.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
@@ -140,6 +141,14 @@ class AgentController extends ChangeNotifier {
     }
   }
 
+  String retryStatus = '';
+  Future<void> Function()? _retry;
+  Completer<void>? _retryCancelled;
+  bool get canRetry => !running && _retry != null;
+  Future<void> retry() async {
+    if (canRetry) await _retry!();
+  }
+
   String sessionId = newId();
   List<Json> history = [];
   final sources = <String, ResourceRef>{};
@@ -185,6 +194,7 @@ class AgentController extends ChangeNotifier {
 
   void cancel() {
     cancelled = true;
+    if (_retryCancelled?.isCompleted == false) _retryCancelled!.complete();
     _scriptRunner?.cancel();
     _http?.close();
     for (final id in _mcpClients.keys.toList()) {
@@ -197,6 +207,7 @@ class AgentController extends ChangeNotifier {
 
   void newSession() {
     if (running) return;
+    _retry = null;
     sessionId = newId();
     sessionScope = null;
     history = [];
@@ -207,6 +218,7 @@ class AgentController extends ChangeNotifier {
 
   Future<void> loadSession(Json record) async {
     if (running) return;
+    _retry = null;
     sessionId = record['id'];
     sessionScope = (record['scope'] as List? ?? [])
         .map((v) => v.toString())
@@ -230,12 +242,19 @@ class AgentController extends ChangeNotifier {
     'sources': {for (final e in sources.entries) e.key: e.value.toJson()},
     'interrupted': running,
   }, ts: DateTime.now().millisecondsSinceEpoch);
-  Future<void> run(String prompt, Set<String> scope, Json plugin) async {
+  Future<void> run(
+    String prompt,
+    Set<String> scope,
+    Json plugin, {
+    bool resume = false,
+  }) async {
     if (running || prompt.trim().isEmpty) return;
     if (scope.any(workspace.isRemovingAccount)) {
       throw const AppFailure('deleted', '账号已删除，请重新选择账号');
     }
     workspace.activeAgentAccounts.addAll(scope);
+    _retry = null;
+    _retryCancelled = Completer<void>();
     running = true;
     cancelled = false;
     error = '';
@@ -243,19 +262,20 @@ class AgentController extends ChangeNotifier {
     notifyListeners();
     final activeScope = Set<String>.unmodifiable(scope);
     Timer? deadline;
+    var awaitingModel = false;
     try {
       if (sessionScope != null && !setEquals(sessionScope, scope)) {
         throw const AppFailure('scope', '更换账号范围请新建会话，避免将原会话资料带入新范围');
       }
       sessionScope = Set.of(scope);
-      _attemptedWrites.clear();
+      if (!resume) _attemptedWrites.clear();
       final settings = await workspace.store.get('settings', 'model') ?? {};
       final uri = completionUri('${settings['baseUrl'] ?? ''}');
       final model = '${settings['model'] ?? ''}';
       final limits = AgentLimits(model, contextLimit: settings['contextLimit']);
       if (model.isEmpty) throw const AppFailure('model', '请先配置模型名称');
       final key = await secureStorage.read(key: modelKey) ?? '';
-      history.add({'role': 'user', 'content': prompt});
+      if (!resume) history.add({'role': 'user', 'content': prompt});
       await _save();
       notifyListeners();
       deadline = Timer(const Duration(minutes: 10), cancel);
@@ -352,73 +372,17 @@ class AgentController extends ChangeNotifier {
           ...history,
         ];
         limits.validate(history, messages, tools);
-        final request = http.Request('POST', uri)
-          ..headers.addAll({
-            'Content-Type': 'application/json',
-            if (key.isNotEmpty) 'Authorization': 'Bearer $key',
-          })
-          ..followRedirects = false
-          ..body = jsonEncode({
-            'model': model,
-            'stream': true,
-            'messages': messages,
-            'max_tokens': limits.maxOutputTokens,
-            if (tools.isNotEmpty) 'tools': tools,
-            if (tools.isNotEmpty) 'tool_choice': 'auto',
-          });
-        final response = await _http!
-            .send(request)
-            .timeout(const Duration(seconds: 45));
-        if (response.statusCode != 200) {
-          await response.stream.drain<void>();
-          throw AppFailure(
-            'model_http',
-            '模型服务返回 ${response.statusCode}；请检查地址、模型和授权',
-          );
-        }
-        streaming = '';
-        final calls = <int, Json>{};
-        var done = false, characters = 0;
-        await for (final data in sseData(
-          response.stream.timeout(const Duration(seconds: 60)),
-        )) {
-          if (cancelled) break;
-          if (data == '[DONE]') {
-            done = true;
-            break;
-          }
-          characters += data.length;
-          if (characters > limits.responseCharacters) {
-            throw const AppFailure('model_limit', '模型响应超过大小限制');
-          }
-          final packet = object(jsonDecode(data));
-          if (packet['error'] != null) {
-            throw const AppFailure('model', '模型返回流式错误');
-          }
-          final choices = packet['choices'] as List? ?? [];
-          if (choices.isEmpty) continue;
-          final choice = object(choices.first), delta = object(choice['delta']);
-          streaming += '${delta['content'] ?? ''}';
-          for (final raw in delta['tool_calls'] as List? ?? []) {
-            final call = object(raw), index = call['index'] as int;
-            final entry = calls[index] ??= {
-              'id': '',
-              'type': 'function',
-              'function': {'name': '', 'arguments': ''},
-            };
-            if (call['id'] != null) entry['id'] = call['id'];
-            final f = object(call['function']);
-            entry['function']['name'] += '${f['name'] ?? ''}';
-            entry['function']['arguments'] += '${f['arguments'] ?? ''}';
-          }
-          if (choice['finish_reason'] != null) done = true;
-          notifyListeners();
-        }
+        awaitingModel = true;
+        final callList = await _requestCompletion(
+          uri,
+          key,
+          model,
+          limits,
+          messages,
+          tools,
+        );
+        awaitingModel = false;
         if (cancelled) break;
-        if (!done) throw const AppFailure('model_stream', '模型连接中断，未执行不完整的工具调用');
-        final ordered = calls.entries.toList()
-          ..sort((a, b) => a.key.compareTo(b.key));
-        final callList = ordered.map((e) => e.value).toList();
         history.add({
           'role': 'assistant',
           'content': streaming,
@@ -473,8 +437,15 @@ class AgentController extends ChangeNotifier {
       }
       if (cancelled) error = '执行已取消；已发出的写操作请查看执行记录';
     } catch (e) {
-      error = cancelled ? '执行已取消' : '$e';
+      if (!cancelled && awaitingModel && isRetryableAgentError(e)) {
+        final savedPlugin = object(jsonDecode(jsonEncode(plugin)));
+        _retry = () => run(prompt, activeScope, savedPlugin, resume: true);
+        error = '连接暂时失败，可重试继续当前任务。$e';
+      } else {
+        error = cancelled ? '执行已取消' : '$e';
+      }
     } finally {
+      retryStatus = '';
       deadline?.cancel();
       await Future.wait(_mcpClients.values.map((c) => c.close()).toList());
       _mcpClients.clear();
@@ -492,6 +463,106 @@ class AgentController extends ChangeNotifier {
         workspace.activeAgentAccounts.removeAll(scope);
       }
       notifyListeners();
+    }
+  }
+
+  Future<List<Json>> _requestCompletion(
+    Uri uri,
+    String key,
+    String model,
+    AgentLimits limits,
+    List<Json> messages,
+    List<Json> tools,
+  ) async {
+    for (var attempt = 0; ; attempt++) {
+      streaming = '';
+      retryStatus = '';
+      notifyListeners();
+      try {
+        final request = http.Request('POST', uri)
+          ..headers.addAll({
+            'Content-Type': 'application/json',
+            if (key.isNotEmpty) 'Authorization': 'Bearer $key',
+          })
+          ..followRedirects = false
+          ..body = jsonEncode({
+            'model': model,
+            'stream': true,
+            'messages': messages,
+            'max_tokens': limits.maxOutputTokens,
+            if (tools.isNotEmpty) 'tools': tools,
+            if (tools.isNotEmpty) 'tool_choice': 'auto',
+          });
+        final response = await _http!
+            .send(request)
+            .timeout(const Duration(seconds: 45));
+        if (response.statusCode != 200) {
+          await response.stream.drain<void>().timeout(
+            const Duration(seconds: 45),
+          );
+          throw AppFailure(
+            [408, 429, 500, 502, 503, 504].contains(response.statusCode)
+                ? 'model_unavailable'
+                : 'model_http',
+            '模型服务返回 ${response.statusCode}；请检查地址、模型和授权',
+          );
+        }
+        streaming = '';
+        final calls = <int, Json>{};
+        var done = false, characters = 0;
+        await for (final data in sseData(
+          response.stream.timeout(const Duration(seconds: 60)),
+        )) {
+          if (cancelled) break;
+          if (data == '[DONE]') {
+            done = true;
+            break;
+          }
+          characters += data.length;
+          if (characters > limits.responseCharacters) {
+            throw const AppFailure('model_limit', '模型响应超过大小限制');
+          }
+          final packet = object(jsonDecode(data));
+          if (packet['error'] != null) {
+            throw const AppFailure('model', '模型返回流式错误');
+          }
+          final choices = packet['choices'] as List? ?? [];
+          if (choices.isEmpty) continue;
+          final choice = object(choices.first), delta = object(choice['delta']);
+          streaming += '${delta['content'] ?? ''}';
+          for (final raw in delta['tool_calls'] as List? ?? []) {
+            final call = object(raw), index = call['index'] as int;
+            final entry = calls[index] ??= {
+              'id': '',
+              'type': 'function',
+              'function': {'name': '', 'arguments': ''},
+            };
+            if (call['id'] != null) entry['id'] = call['id'];
+            final f = object(call['function']);
+            entry['function']['name'] += '${f['name'] ?? ''}';
+            entry['function']['arguments'] += '${f['arguments'] ?? ''}';
+          }
+          if (choice['finish_reason'] != null) done = true;
+          notifyListeners();
+        }
+        if (cancelled) throw const AppFailure('cancelled', '执行已取消');
+        if (!done) throw const AppFailure('model_stream', '模型连接中断，未执行不完整的工具调用');
+        final ordered = calls.entries.toList()
+          ..sort((a, b) => a.key.compareTo(b.key));
+        return ordered.map((e) => e.value).toList();
+      } catch (e) {
+        if (cancelled || !isRetryableAgentError(e) || attempt >= 2) rethrow;
+        _http?.close();
+        _http = http.Client();
+        streaming = '';
+        retryStatus = '连接中断，${attempt + 1} 秒后自动重试（${attempt + 1}/2）';
+        notifyListeners();
+        await Future.any([
+          Future<void>.delayed(Duration(seconds: attempt + 1)),
+          _retryCancelled!.future,
+        ]);
+        if (cancelled) throw const AppFailure('cancelled', '执行已取消');
+      }
     }
   }
 
@@ -807,3 +878,12 @@ class AgentController extends ChangeNotifier {
     super.dispose();
   }
 }
+
+/// Only transport failures and transient model responses are retryable.
+bool isRetryableAgentError(Object error) =>
+    error is SocketException ||
+    error is HandshakeException ||
+    error is TimeoutException ||
+    error is http.ClientException ||
+    (error is AppFailure &&
+        ['model_unavailable', 'model_stream'].contains(error.code));
