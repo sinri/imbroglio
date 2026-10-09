@@ -8,6 +8,10 @@ import 'workspace.dart';
 class DesktopIntegration with WindowListener {
   final Workspace workspace;
   TrayIcon? icon;
+  Menu? _trayMenu;
+  MenuItem? _openItem;
+  MenuItem? _quitItem;
+  var _quitting = false;
   DesktopIntegration(this.workspace);
   Future<void> initialize() async {
     windowManager.addListener(this);
@@ -72,22 +76,28 @@ class DesktopIntegration with WindowListener {
         '退出并停止同步',
         MenuItemType.normal,
       )!;
-      quit.addListener((event) async {
-        if (event is MenuItemClickedEvent) {
-          await workspace.close();
-          icon?.dispose();
-          if (Platform.isMacOS) {
-            await windowManager.destroy();
-          } else {
-            await windowManager.setPreventClose(false);
-            await windowManager.close();
-          }
+      quit.addListener((event) {
+        if (event is MenuItemClickedEvent && _quitItem != null) {
+          // The click is delivered inside the native menu loop. Leave that
+          // call before tearing down the tray icon and the process.
+          Future<void>(() => quitApp());
         }
       });
       menu.addItem(quit);
+      // Menu items free their native handles when collected. Keep them alive
+      // for as long as the tray icon is shown.
+      _trayMenu = menu;
+      _openItem = open;
+      _quitItem = quit;
       icon!.setContextMenu(menu);
+      // Windows leaves the trigger at None, so assigning a menu does not open
+      // it. Right-click is the notification-area convention.
+      if (Platform.isWindows) {
+        icon!.setContextMenuTrigger(ContextMenuTrigger.rightClicked);
+      }
       icon!.setVisible(true);
       icon!.addListener((event) {
+        if (_trayMenu == null || _openItem == null) return;
         if (event is TrayIconClickedEvent) show();
       });
       await windowManager.setPreventClose(true);
@@ -103,6 +113,30 @@ class DesktopIntegration with WindowListener {
     await windowManager.focus();
   }
 
+  /// Stops sync, removes the tray icon, and ends the process.
+  ///
+  /// Closing the window only hides it while the tray icon exists. This path
+  /// clears that icon first so the close is not turned back into a hide.
+  Future<void> quitApp() async {
+    if (_quitting) return;
+    _quitting = true;
+    final tray = icon;
+    icon = null;
+    try {
+      await workspace.close();
+    } catch (_) {
+      /* still leave the process */
+    }
+    tray?.dispose();
+    try {
+      await windowManager.setPreventClose(false);
+      await windowManager.destroy();
+    } catch (_) {
+      /* the process exit below is the backstop */
+    }
+    exit(0);
+  }
+
   @override
   void onWindowFocus() {
     workspace.updateReading(focused: true);
@@ -115,6 +149,7 @@ class DesktopIntegration with WindowListener {
 
   @override
   void onWindowClose() async {
+    if (_quitting) return;
     if (Platform.isMacOS || icon != null) await windowManager.hide();
   }
 }
